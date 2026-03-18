@@ -12,6 +12,7 @@ import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.nn.parallel import DataParallel
+from torch.utils.data import DataLoader, TensorDataset
 
 from cnn_transformer_only.config import CNNTransformerConfig
 from cnn_transformer_only.data import (
@@ -212,12 +213,10 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
     )
 
     # Build test loader for held-out evaluation
-    from torch.utils.data import DataLoader as DL
-
     test_loader = None
     if len(y_test) > 0:
         test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.LongTensor(y_test))
-        test_loader = DL(
+        test_loader = DataLoader(
             test_dataset,
             batch_size=config.val_batch_size,
             shuffle=False,
