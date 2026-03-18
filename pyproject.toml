@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cnn-transformer-only"
+version = "0.1.0"
+description = "Standalone CNN-Transformer IDS pipeline (testing)"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "scikit-learn>=1.3",
+  "torch>=2.1",
+  "joblib>=1.3",
+  "matplotlib>=3.7",
+  "shap>=0.45",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
