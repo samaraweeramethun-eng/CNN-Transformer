@@ -1,4 +1,4 @@
-# CNN-Transformer Only (Testing)
+# CNN-Transformer (Testing)
 
 Standalone subproject containing only the CNN-Transformer intrusion detection pipeline (training + evaluation + Integrated Gradients + Grad-CAM + SHAP).
 
