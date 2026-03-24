@@ -59,16 +59,19 @@ class GradCAM:
 
 
 def _resolve_target_layer(model: torch.nn.Module) -> torch.nn.Module:
+    # CNNTransformerIDS: model.tokenizer.conv
     tokenizer = getattr(model, "tokenizer", None) or getattr(model, "cnn_tokenizer", None)
-    if tokenizer is None:
-        raise ValueError("Model has no 'tokenizer'/'cnn_tokenizer' attribute")
-    conv_seq = getattr(tokenizer, "conv", None)
+    if tokenizer is not None:
+        conv_seq = getattr(tokenizer, "conv", None)
+    else:
+        # CNNClassifier: model.conv directly
+        conv_seq = getattr(model, "conv", None)
     if conv_seq is None:
-        raise ValueError("Tokenizer has no 'conv' Sequential")
+        raise ValueError("Model has no recognisable conv sequential (checked tokenizer.conv and model.conv)")
     for layer in reversed(list(conv_seq.children())):
         if isinstance(layer, torch.nn.Conv1d):
             return layer
-    raise ValueError("No Conv1d layer found in tokenizer.conv")
+    raise ValueError("No Conv1d layer found in conv sequential")
 
 
 def generate_gradcam_report(

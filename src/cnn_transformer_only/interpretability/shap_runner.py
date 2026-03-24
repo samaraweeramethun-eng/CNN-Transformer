@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from cnn_transformer_only.models.cnn_classifier import CNNClassifier
 from cnn_transformer_only.models.cnn_transformer import CNNTransformerIDS
 from cnn_transformer_only.utils.device import setup_device
 from cnn_transformer_only.data import detect_label_column
@@ -34,10 +35,37 @@ def _build_cnn_model(state, cfg, device):
     return model
 
 
+def _build_cnn_classifier_model(state, cfg, device):
+    conv_weight = state.get("conv.0.weight")
+    if conv_weight is None:
+        raise KeyError("CNN classifier checkpoint missing conv.0.weight; cannot infer channels")
+    conv_channels = int(conv_weight.shape[0])
+
+    fc_weight = state.get("classifier.1.weight")
+    if fc_weight is None:
+        raise KeyError("CNN classifier checkpoint missing classifier.1.weight; cannot infer fc dim")
+    fc_dim = int(fc_weight.shape[0])
+
+    input_dim = cfg.get("input_dim", 0)
+    model = CNNClassifier(
+        input_dim=input_dim,
+        conv_channels=cfg.get("conv_channels", conv_channels),
+        fc_dim=cfg.get("cnn_fc_dim", fc_dim),
+        dropout=cfg.get("dropout", 0.2),
+    ).to(device)
+    return model
+
+
 def build_model_from_ckpt(ckpt, device):
     state = ckpt["model_state_dict"]
     cfg = ckpt.get("config", {})
-    model = _build_cnn_model(state, cfg, device)
+    model_type = ckpt.get("model_type", "cnn_transformer")
+
+    if model_type == "cnn_classifier":
+        model = _build_cnn_classifier_model(state, cfg, device)
+    else:
+        model = _build_cnn_model(state, cfg, device)
+
     model.load_state_dict(state, strict=True)
     model.eval()
     return model

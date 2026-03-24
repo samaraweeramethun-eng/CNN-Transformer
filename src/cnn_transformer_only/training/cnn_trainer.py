@@ -200,7 +200,6 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
     del X_train, y_train
     gc.collect()
 
-    max_samples = getattr(config, "max_train_samples", 0)
     train_loader, val_loader, _ = build_dataloaders(
         X_train_bal,
         y_train_bal,
@@ -209,7 +208,6 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
         batch_size=config.batch_size,
         val_batch_size=config.val_batch_size,
         num_workers=config.num_workers,
-        max_train_samples=max_samples,
     )
 
     # Build test loader for held-out evaluation

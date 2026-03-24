@@ -77,15 +77,9 @@ def build_dataloaders(
     val_batch_size: int,
     num_workers: int,
     pin_memory: bool | None = None,
-    max_train_samples: int = 0,
 ):
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
-    if max_train_samples > 0 and len(X_train) > max_train_samples:
-        rng = np.random.RandomState(42)
-        idx = rng.choice(len(X_train), size=max_train_samples, replace=False)
-        X_train = X_train[idx]
-        y_train = y_train[idx]
     train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
     val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.LongTensor(y_val))
     use_persistent = num_workers > 0

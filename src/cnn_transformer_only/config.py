@@ -24,4 +24,4 @@ class CNNTransformerConfig:
     ig_steps: int = 32
     ig_samples: int = 512
     num_workers: int = 2
-    max_train_samples: int = 500_000  # cap training set after balancing
+    cnn_fc_dim: int = 128  # hidden dim for standalone CNN classifier head

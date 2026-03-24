@@ -31,7 +31,6 @@ def main() -> int:
         cfg.d_ff = 256
         cfg.ig_steps = 8
         cfg.ig_samples = 128
-        cfg.max_train_samples = 0
 
     if args.epochs and args.epochs > 0:
         cfg.epochs = args.epochs
