@@ -16,6 +16,12 @@ pip install -e cnn-transformer-only
 python cnn-transformer-only/scripts/train.py --data data/cicids2017/cicids2017_sample.csv --output-dir artifacts --epochs 5
 ```
 
+For CICIDS2018 day-wise CSV files, pass the folder (or a glob):
+
+```bash
+python scripts/train.py --data data/cicids2018 --output-dir artifacts/cicids2018 --epochs 25
+```
+
 ## Kaggle
 
 Open the notebook at `cnn-transformer-only/notebooks/kaggle_cnn_transformer_only.ipynb`.

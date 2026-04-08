@@ -7,7 +7,11 @@ from cnn_transformer_only.training.cnn_trainer import train_cnn_transformer
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train CNN-Transformer IDS (standalone)")
-    p.add_argument("--data", required=True, help="Path to CICIDS CSV")
+    p.add_argument(
+        "--data",
+        required=True,
+        help="Path to CICIDS CSV file, folder, glob pattern, or comma-separated CSV list",
+    )
     p.add_argument("--output-dir", default="artifacts", help="Where to write artifacts")
     p.add_argument("--epochs", type=int, default=0, help="Override epochs (0 = config default)")
     p.add_argument("--batch-size", type=int, default=0, help="Override batch size (0 = config default)")

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import glob
+import os
+
 import numpy as np
 import pandas as pd
 import torch
@@ -45,6 +48,65 @@ class IntelligentDataBalancer:
         return X[combined_idx], y[combined_idx]
 
 
+def resolve_cicids_csv_paths(input_path: str) -> list[str]:
+    """Resolve input into a sorted list of CSV files.
+
+    Supports:
+    - Single CSV file path
+    - Directory containing CSV files
+    - Glob pattern (e.g. data/cicids2018/*.csv)
+    - Comma-separated list of CSV paths
+    """
+    if not input_path or not input_path.strip():
+        raise ValueError("Input path is empty")
+
+    raw = input_path.strip()
+    paths: list[str] = []
+
+    if "," in raw:
+        for item in raw.split(","):
+            item = item.strip()
+            if item:
+                paths.append(item)
+    elif os.path.isdir(raw):
+        paths = sorted(glob.glob(os.path.join(raw, "*.csv")))
+    elif any(ch in raw for ch in ["*", "?", "["]):
+        paths = sorted(glob.glob(raw))
+    else:
+        paths = [raw]
+
+    expanded = [os.path.abspath(p) for p in paths]
+    csv_paths = [p for p in expanded if p.lower().endswith(".csv")]
+
+    if not csv_paths:
+        raise FileNotFoundError(f"No CSV files found for input: {input_path}")
+
+    missing = [p for p in csv_paths if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(f"Missing CSV file(s): {missing}")
+
+    return sorted(csv_paths)
+
+
+def load_cicids_dataframe(input_path: str) -> pd.DataFrame:
+    """Load one or many CICIDS CSV files into a single dataframe."""
+    csv_paths = resolve_cicids_csv_paths(input_path)
+    if len(csv_paths) == 1:
+        df = pd.read_csv(csv_paths[0], low_memory=False)
+        df.columns = [str(col).strip() for col in df.columns]
+        return df
+
+    frames: list[pd.DataFrame] = []
+    for path in csv_paths:
+        df = pd.read_csv(path, low_memory=False)
+        # CICIDS exports can include spacing inconsistencies in headers.
+        df.columns = [str(col).strip() for col in df.columns]
+        frames.append(df)
+
+    merged = pd.concat(frames, axis=0, ignore_index=True, sort=False)
+    return merged
+
+
 def detect_label_column(df: pd.DataFrame) -> str:
     for col in df.columns:
         if "label" in col.lower():
@@ -54,7 +116,11 @@ def detect_label_column(df: pd.DataFrame) -> str:
 
 def prepare_features(df: pd.DataFrame, label_col: str):
     """Extract features as a float32 numpy array to minimise memory."""
-    binary_label = (df[label_col] != "BENIGN").astype(np.int8).values
+    df = df.copy()
+    df.columns = [str(col).strip() for col in df.columns]
+    label_col = label_col.strip()
+    label_series = df[label_col].astype(str).str.strip().str.upper()
+    binary_label = (label_series != "BENIGN").astype(np.int8).values
     blacklist = {label_col, "Flow ID", "Source IP", "Destination IP", "Timestamp"}
     feature_cols = [col for col in df.columns if col not in blacklist]
     X = df[feature_cols]

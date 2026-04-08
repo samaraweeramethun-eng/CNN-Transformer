@@ -22,6 +22,7 @@ from cnn_transformer_only.data import (
     calculate_comprehensive_metrics,
     detect_label_column,
     find_best_f1_threshold,
+    load_cicids_dataframe,
     prepare_features,
 )
 from cnn_transformer_only.interpretability.grad_cam import generate_gradcam_report
@@ -181,7 +182,7 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
     os.makedirs(config.output_dir, exist_ok=True)
 
     print("Loading dataset for CNN-Transformer training...")
-    df = pd.read_csv(config.input_path, low_memory=False)
+    df = load_cicids_dataframe(config.input_path)
     label_col = detect_label_column(df)
     X, y, feature_cols = prepare_features(df, label_col)
     del df
