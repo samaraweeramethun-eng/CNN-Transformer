@@ -20,10 +20,8 @@ from cnn_transformer_only.data import (
     binary_predictions_from_proba,
     build_dataloaders,
     calculate_comprehensive_metrics,
-    detect_label_column,
     find_best_f1_threshold,
-    load_cicids_dataframe,
-    prepare_features,
+    load_cicids_feature_matrix,
 )
 from cnn_transformer_only.interpretability.grad_cam import generate_gradcam_report
 from cnn_transformer_only.interpretability.integrated_gradients import generate_ig_report
@@ -182,11 +180,12 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
     os.makedirs(config.output_dir, exist_ok=True)
 
     print("Loading dataset for CNN-Transformer training...")
-    df = load_cicids_dataframe(config.input_path)
-    label_col = detect_label_column(df)
-    X, y, feature_cols = prepare_features(df, label_col)
-    del df
-    gc.collect()
+    X, y, feature_cols, _ = load_cicids_feature_matrix(
+        config.input_path,
+        max_rows=getattr(config, "max_rows", 0),
+        chunksize=getattr(config, "csv_chunksize", 200_000),
+    )
+    print(f"Loaded rows: {len(y):,} | Features: {len(feature_cols)}")
 
     X_train, X_val, X_test, y_train, y_val, y_test, scaler, medians = _prepare_scaled_data(
         X, y, config

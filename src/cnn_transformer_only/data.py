@@ -107,6 +107,89 @@ def load_cicids_dataframe(input_path: str) -> pd.DataFrame:
     return merged
 
 
+def load_cicids_feature_matrix(
+    input_path: str,
+    max_rows: int = 0,
+    chunksize: int = 200_000,
+) -> tuple[np.ndarray, np.ndarray, list[str], str]:
+    """Load CICIDS CSV(s) into float32 feature matrix + binary labels using chunked IO.
+
+    This avoids creating one giant dataframe in memory, which is important for Kaggle
+    and other constrained environments.
+    """
+    csv_paths = resolve_cicids_csv_paths(input_path)
+
+    header_df = pd.read_csv(csv_paths[0], nrows=0)
+    header_df.columns = [str(col).strip() for col in header_df.columns]
+    label_col = detect_label_column(header_df)
+
+    blacklist = {label_col, "Flow ID", "Source IP", "Destination IP", "Timestamp"}
+    feature_cols = [col for col in header_df.columns if col not in blacklist]
+    feature_count = len(feature_cols)
+
+    if feature_count == 0:
+        raise ValueError("No feature columns found after excluding metadata/label columns")
+
+    use_cap = max_rows is not None and int(max_rows) > 0
+    cap = int(max_rows) if use_cap else 0
+
+    if use_cap:
+        x_data = np.empty((cap, feature_count), dtype=np.float32)
+        y_data = np.empty((cap,), dtype=np.int8)
+    else:
+        x_parts: list[np.ndarray] = []
+        y_parts: list[np.ndarray] = []
+
+    rows_written = 0
+    for path in csv_paths:
+        for chunk in pd.read_csv(path, low_memory=False, chunksize=chunksize):
+            chunk.columns = [str(col).strip() for col in chunk.columns]
+            if label_col not in chunk.columns:
+                raise ValueError(f"Label column '{label_col}' missing in file: {path}")
+
+            labels = chunk[label_col].astype(str).str.strip().str.upper()
+            y_chunk = (labels != "BENIGN").astype(np.int8).to_numpy()
+
+            x_chunk_df = chunk.reindex(columns=feature_cols)
+            obj_cols = x_chunk_df.select_dtypes(include=["object"]).columns
+            if len(obj_cols) > 0:
+                x_chunk_df = x_chunk_df.copy()
+                for col in obj_cols:
+                    x_chunk_df[col] = pd.to_numeric(x_chunk_df[col], errors="coerce")
+
+            x_chunk = x_chunk_df.to_numpy(dtype=np.float32, copy=False)
+            np.nan_to_num(x_chunk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if use_cap:
+                remaining = cap - rows_written
+                if remaining <= 0:
+                    break
+                take = min(len(y_chunk), remaining)
+                if take > 0:
+                    x_data[rows_written:rows_written + take] = x_chunk[:take]
+                    y_data[rows_written:rows_written + take] = y_chunk[:take]
+                    rows_written += take
+            else:
+                x_parts.append(x_chunk)
+                y_parts.append(y_chunk)
+                rows_written += len(y_chunk)
+
+            del chunk, x_chunk_df, x_chunk, y_chunk
+
+        if use_cap and rows_written >= cap:
+            break
+
+    if rows_written == 0:
+        raise ValueError("No rows were loaded from the provided CICIDS input")
+
+    if use_cap:
+        return x_data[:rows_written], y_data[:rows_written], feature_cols, label_col
+
+    x_all = np.concatenate(x_parts, axis=0)
+    y_all = np.concatenate(y_parts, axis=0)
+    return x_all, y_all, feature_cols, label_col
+
+
 def detect_label_column(df: pd.DataFrame) -> str:
     for col in df.columns:
         if "label" in col.lower():

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 class CNNTransformerConfig:
     input_path: str = "data/cicids2017/cicids2017.csv"
     output_dir: str = "artifacts"
+    csv_chunksize: int = 200_000
+    max_rows: int = 0  # 0 = load all rows
     val_size: float = 0.1
     test_size: float = 0.2
     random_state: int = 42
