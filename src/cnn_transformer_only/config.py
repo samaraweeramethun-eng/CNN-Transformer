@@ -27,3 +27,6 @@ class CNNTransformerConfig:
     ig_samples: int = 512
     num_workers: int = 2
     cnn_fc_dim: int = 128  # hidden dim for standalone CNN classifier head
+    grouped_split: bool = True
+    correlation_threshold: float = 0.95
+    skew_threshold: float = 5.0

@@ -9,8 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 from torch.nn.parallel import DataParallel
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -22,6 +20,7 @@ from cnn_transformer_only.data import (
     calculate_comprehensive_metrics,
     find_best_f1_threshold,
     load_cicids_feature_matrix,
+    prepare_training_data,
 )
 from cnn_transformer_only.interpretability.grad_cam import generate_gradcam_report
 from cnn_transformer_only.interpretability.integrated_gradients import generate_ig_report
@@ -35,61 +34,7 @@ def _set_seeds(seed: int):
     random.seed(seed)
 
 
-def _prepare_scaled_data(X_np: np.ndarray, y: np.ndarray, config: CNNTransformerConfig):
-    """Three-way split (train/val/test), scale, return float32 arrays."""
-    val_ratio = getattr(config, "val_size", 0.1)
-    test_ratio = config.test_size
-    holdout_ratio = val_ratio + test_ratio
-
-    X_train_raw, X_holdout, y_train, y_holdout = train_test_split(
-        X_np,
-        y,
-        test_size=holdout_ratio,
-        stratify=y,
-        random_state=config.random_state,
-    )
-
-    if val_ratio > 0 and test_ratio > 0 and len(y_holdout) > 0:
-        test_fraction = test_ratio / holdout_ratio
-        X_val_raw, X_test_raw, y_val, y_test = train_test_split(
-            X_holdout,
-            y_holdout,
-            test_size=test_fraction,
-            stratify=y_holdout,
-            random_state=config.random_state,
-        )
-    elif val_ratio > 0:
-        X_val_raw, y_val = X_holdout, y_holdout
-        X_test_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
-        y_test = np.empty(0, dtype=np.int64)
-    else:
-        X_test_raw, y_test = X_holdout, y_holdout
-        X_val_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
-        y_val = np.empty(0, dtype=np.int64)
-
-    del X_holdout, y_holdout
-    gc.collect()
-
-    train_medians = pd.Series(np.nanmedian(X_train_raw, axis=0))
-
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train_raw).astype(np.float32)
-    del X_train_raw
-    gc.collect()
-
-    X_val = scaler.transform(X_val_raw).astype(np.float32)
-    del X_val_raw
-    gc.collect()
-
-    X_test = (
-        scaler.transform(X_test_raw).astype(np.float32)
-        if len(X_test_raw) > 0
-        else np.empty((0, X_train.shape[1]), dtype=np.float32)
-    )
-    del X_test_raw
-    gc.collect()
-
-    return X_train, X_val, X_test, y_train, y_val, y_test, scaler, train_medians
+# _prepare_scaled_data removed — replaced by prepare_training_data in data.py
 
 
 def _train_epoch(model, loader, criterion, optimizer, scheduler, device):
@@ -180,15 +125,18 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
     os.makedirs(config.output_dir, exist_ok=True)
 
     print("Loading dataset for CNN-Transformer training...")
-    X, y, feature_cols, _ = load_cicids_feature_matrix(
+    X, y, feature_cols, _, source_groups = load_cicids_feature_matrix(
         config.input_path,
         max_rows=getattr(config, "max_rows", 0),
         chunksize=getattr(config, "csv_chunksize", 200_000),
+        return_source_groups=True,
     )
     print(f"Loaded rows: {len(y):,} | Features: {len(feature_cols)}")
 
-    X_train, X_val, X_test, y_train, y_val, y_test, scaler, medians = _prepare_scaled_data(
-        X, y, config
+    print("Running enhanced preprocessing pipeline...")
+    (X_train, X_val, X_test, y_train, y_val, y_test,
+     scaler, medians, feature_cols, prep_meta) = prepare_training_data(
+        X, y, feature_cols, config, source_groups=source_groups,
     )
     del X
     gc.collect()
@@ -275,6 +223,9 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
                 "medians": medians.to_dict(),
                 "mean": scaler.mean_.tolist(),
                 "scale": scaler.scale_.tolist(),
+                "log1p_columns": prep_meta["log1p_columns"],
+                "indicator_source_columns": prep_meta["indicator_source_columns"],
+                "csv_columns": prep_meta["csv_feature_cols"],
             }
             best_state = {
                 "model_state_dict": state_dict,

@@ -78,9 +78,30 @@ class StandardScalerPreprocessor:
         self.fill_values = {col: medians.get(col, 0.0) for col in feature_cols}
         self.mean = np.array(state.get("mean", []), dtype=np.float32)
         self.scale = np.array(state.get("scale", []), dtype=np.float32)
+        self.log1p_columns = state.get("log1p_columns", [])
+        self.indicator_source_columns = state.get("indicator_source_columns", [])
+        self.csv_columns = state.get("csv_columns", list(feature_cols))
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
-        filled = df.fillna(self.fill_values)
+        # Create missing-indicator columns if needed
+        for src_col in self.indicator_source_columns:
+            ind_name = f"{src_col}_missing"
+            if ind_name in self.feature_cols and src_col in df.columns:
+                df = df.copy() if not df._is_copy else df
+                df[ind_name] = df[src_col].isna().astype(np.float32)
+
+        # Ensure all expected columns exist (fill missing with 0)
+        for col in self.feature_cols:
+            if col not in df.columns:
+                df[col] = 0.0
+
+        filled = df[self.feature_cols].fillna(self.fill_values)
+
+        # Apply log1p to the same features as during training
+        for col in self.log1p_columns:
+            if col in filled.columns:
+                filled[col] = np.log1p(np.clip(filled[col], 0, None))
+
         arr = filled.to_numpy(dtype=np.float32, copy=False)
         if self.mean.size != arr.shape[1] or self.scale.size != arr.shape[1]:
             return arr
@@ -175,11 +196,22 @@ def run_shap(
     df_head = pd.read_csv(data_path, nrows=5)
     label_col = detect_label_column(df_head)
 
-    if saved_feature_cols:
-        missing = [col for col in saved_feature_cols if col not in df_head.columns]
-        if missing:
-            raise ValueError("Saved feature columns missing in provided data: " + ", ".join(missing))
-        feature_cols = list(saved_feature_cols)
+    preprocessor_state = ckpt.get("preprocessor")
+
+    # Use csv_columns (base features from CSV) for data extraction;
+    # the preprocessor will add indicator columns during transform.
+    csv_columns = (
+        preprocessor_state.get("csv_columns")
+        if preprocessor_state
+        else None
+    )
+
+    if csv_columns:
+        feature_cols_for_csv = list(csv_columns)
+    elif saved_feature_cols:
+        feature_cols_for_csv = [
+            c for c in saved_feature_cols if not c.endswith("_missing")
+        ]
     else:
         exclude_cols = [
             label_col,
@@ -189,16 +221,29 @@ def run_shap(
             "Destination IP",
             "Timestamp",
         ]
-        feature_cols = [col for col in df_head.columns if col not in exclude_cols]
+        feature_cols_for_csv = [
+            col for col in df_head.columns if col not in exclude_cols
+        ]
 
-    preprocessor_state = ckpt.get("preprocessor")
+    missing = [
+        col for col in feature_cols_for_csv if col not in df_head.columns
+    ]
+    if missing:
+        raise ValueError(
+            "Saved feature columns missing in provided data: "
+            + ", ".join(missing)
+        )
+
+    # feature_cols is the full set the model expects (including indicators)
+    feature_cols = list(saved_feature_cols) if saved_feature_cols else list(feature_cols_for_csv)
+
     preprocessor = resolve_preprocessor(preprocessor_state, feature_cols)
 
     sample_cap = max(eval_pool, background_size, eval_size)
     X_all, y_all, total_rows = prepare_eval_matrix(
         data_path,
         label_col,
-        feature_cols,
+        feature_cols_for_csv,
         preprocessor,
         sample_size=sample_cap,
         random_state=random_seed,
