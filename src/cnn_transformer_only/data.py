@@ -274,6 +274,16 @@ def build_dataloaders(
 def calculate_comprehensive_metrics(y_true, y_pred, y_prob):
     if len(y_true) == 0:
         return {key: 0.0 for key in ["accuracy", "auc_roc", "auc_pr", "f1_score", "precision", "recall"]}
+
+    y_prob = np.asarray(y_prob, dtype=np.float64)
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    # Replace NaN/inf in probabilities to prevent sklearn errors
+    nan_mask = ~np.isfinite(y_prob)
+    if nan_mask.any():
+        y_prob = np.nan_to_num(y_prob, nan=0.0, posinf=1.0, neginf=0.0)
+
     accuracy = float(np.mean(y_true == y_pred))
     unique_classes = np.unique(y_true)
     if len(unique_classes) < 2:
