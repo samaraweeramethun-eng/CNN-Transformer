@@ -30,3 +30,4 @@ class CNNTransformerConfig:
     grouped_split: bool = True
     correlation_threshold: float = 0.95
     skew_threshold: float = 5.0
+    near_dup_decimals: int = 3  # round features to N decimals before dedup (0 = disabled)

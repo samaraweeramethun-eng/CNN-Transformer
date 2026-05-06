@@ -391,9 +391,30 @@ def prepare_training_data(
         y = y[uniq_idx]
         if source_groups is not None:
             source_groups = source_groups[uniq_idx]
-        print(f"  Removed {n_before - len(uniq_idx):,} duplicate rows "
+        print(f"  Removed {n_before - len(uniq_idx):,} exact-duplicate rows "
               f"({n_before:,} -> {len(uniq_idx):,})")
     del row_view
+
+    # ── 2b. Remove near-duplicate rows (round then dedup) ─────────────
+    nd_dec = getattr(config, "near_dup_decimals", 3)
+    if nd_dec > 0:
+        n_pre = len(y)
+        X_rounded = np.round(np.nan_to_num(X_np, nan=-999.0), decimals=nd_dec)
+        rounded_view = np.ascontiguousarray(X_rounded).view(
+            np.dtype((np.void, X_rounded.dtype.itemsize * X_rounded.shape[1]))
+        ).ravel()
+        _, nd_idx = np.unique(rounded_view, return_index=True)
+        nd_idx.sort()
+        if len(nd_idx) < n_pre:
+            X_np = X_np[nd_idx]
+            y = y[nd_idx]
+            if source_groups is not None:
+                source_groups = source_groups[nd_idx]
+            print(f"  Removed {n_pre - len(nd_idx):,} near-duplicate rows "
+                  f"(rounded to {nd_dec} decimals: {n_pre:,} -> {len(nd_idx):,})")
+        else:
+            print(f"  Near-duplicate check ({nd_dec} decimals): no additional duplicates")
+        del X_rounded, rounded_view
 
     # ── 3. Drop constant / zero-variance columns ─────────────────────
     col_var = np.nanvar(X_np, axis=0)
@@ -443,46 +464,53 @@ def prepare_training_data(
     split_done = False
     if use_grouped:
         unique_groups = np.unique(source_groups)
-        if len(unique_groups) >= 3:
-            gss = GroupShuffleSplit(
-                n_splits=1, test_size=holdout_ratio,
-                random_state=config.random_state,
-            )
-            trn_idx, hld_idx = next(gss.split(X_np, y, source_groups))
-            X_train_raw = X_np[trn_idx]
-            y_train = y[trn_idx]
-            X_holdout = X_np[hld_idx]
-            y_holdout = y[hld_idx]
+        if len(unique_groups) < 3:
+            # Single/few CSV(s): create sequential block groups as a
+            # temporal proxy so GroupShuffleSplit keeps contiguous rows
+            # together, reducing near-duplicate leakage across splits.
+            n_orig = len(unique_groups)
+            n_blocks = max(5, min(10, len(y) // 10_000))
+            source_groups = (np.arange(len(y)) * n_blocks // len(y)).astype(np.int32)
+            unique_groups = np.unique(source_groups)
+            print(f"  Only {n_orig} CSV source(s); created {len(unique_groups)} "
+                  f"sequential blocks for grouped split (temporal proxy)")
 
-            if val_ratio > 0 and test_ratio > 0 and len(y_holdout) > 1:
-                test_frac = test_ratio / holdout_ratio
-                try:
-                    X_val_raw, X_test_raw, y_val, y_test = train_test_split(
-                        X_holdout, y_holdout, test_size=test_frac,
-                        stratify=y_holdout, random_state=config.random_state,
-                    )
-                except ValueError:
-                    X_val_raw, X_test_raw, y_val, y_test = train_test_split(
-                        X_holdout, y_holdout, test_size=test_frac,
-                        random_state=config.random_state,
-                    )
-            elif val_ratio > 0:
-                X_val_raw, y_val = X_holdout, y_holdout
-                X_test_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
-                y_test = np.empty(0, dtype=np.int64)
-            else:
-                X_test_raw, y_test = X_holdout, y_holdout
-                X_val_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
-                y_val = np.empty(0, dtype=np.int64)
+        gss = GroupShuffleSplit(
+            n_splits=1, test_size=holdout_ratio,
+            random_state=config.random_state,
+        )
+        trn_idx, hld_idx = next(gss.split(X_np, y, source_groups))
+        X_train_raw = X_np[trn_idx]
+        y_train = y[trn_idx]
+        X_holdout = X_np[hld_idx]
+        y_holdout = y[hld_idx]
 
-            split_done = True
-            trn_atk = y_train.sum() / len(y_train) * 100
-            print(f"  Grouped split ({len(unique_groups)} source files) -> "
-                  f"train {len(y_train):,} ({trn_atk:.1f}% attack), "
-                  f"val {len(y_val):,}, test {len(y_test):,}")
+        if val_ratio > 0 and test_ratio > 0 and len(y_holdout) > 1:
+            test_frac = test_ratio / holdout_ratio
+            try:
+                X_val_raw, X_test_raw, y_val, y_test = train_test_split(
+                    X_holdout, y_holdout, test_size=test_frac,
+                    stratify=y_holdout, random_state=config.random_state,
+                )
+            except ValueError:
+                X_val_raw, X_test_raw, y_val, y_test = train_test_split(
+                    X_holdout, y_holdout, test_size=test_frac,
+                    random_state=config.random_state,
+                )
+        elif val_ratio > 0:
+            X_val_raw, y_val = X_holdout, y_holdout
+            X_test_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
+            y_test = np.empty(0, dtype=np.int64)
         else:
-            print(f"  Too few groups ({len(unique_groups)}) for grouped split; "
-                  f"falling back to stratified")
+            X_test_raw, y_test = X_holdout, y_holdout
+            X_val_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
+            y_val = np.empty(0, dtype=np.int64)
+
+        split_done = True
+        trn_atk = y_train.sum() / len(y_train) * 100
+        print(f"  Grouped split ({len(unique_groups)} groups) -> "
+              f"train {len(y_train):,} ({trn_atk:.1f}% attack), "
+              f"val {len(y_val):,}, test {len(y_test):,}")
 
     if not split_done:
         X_train_raw, X_holdout, y_train, y_holdout = train_test_split(
