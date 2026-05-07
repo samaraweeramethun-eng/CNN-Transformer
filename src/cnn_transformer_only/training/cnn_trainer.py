@@ -67,16 +67,51 @@ def _check_model_params_health(model) -> bool:
 # ─── Threshold search ──────────────────────────────────────────────────────────
 
 def _find_best_threshold_fine(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[float, float]:
-    """Search thresholds 0.05–0.95 in 0.01 steps; return (best_threshold, best_f1)."""
+    """Search thresholds with fine resolution; return (best_threshold, best_f1).
+    
+    Resolution:
+    - 0.001 to 0.05 in steps of 0.001 (50 steps)
+    - 0.05 to 0.95 in steps of 0.01 (90 steps)
+    Total: 140 threshold candidates
+    """
     from sklearn.metrics import f1_score as sk_f1
     best_thr, best_f1 = 0.5, 0.0
+    
+    # Fine search near low thresholds
+    for thr in np.arange(0.001, 0.051, 0.001):
+        preds = (y_prob >= thr).astype(int)
+        f1 = sk_f1(y_true, preds, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = float(thr)
+    
+    # Coarser search for higher thresholds
     for thr in np.arange(0.05, 0.96, 0.01):
         preds = (y_prob >= thr).astype(int)
         f1 = sk_f1(y_true, preds, zero_division=0)
         if f1 > best_f1:
             best_f1 = f1
             best_thr = float(thr)
+    
     return best_thr, best_f1
+
+
+def _compute_prob_diagnostics(y_prob: np.ndarray, y_true: np.ndarray) -> dict:
+    """Compute probability distribution diagnostics for each class."""
+    benign_probs = y_prob[y_true == 0]
+    attack_probs = y_prob[y_true == 1]
+    
+    diag = {
+        "mean_prob_benign": float(np.mean(benign_probs)) if len(benign_probs) > 0 else 0.0,
+        "mean_prob_attack": float(np.mean(attack_probs)) if len(attack_probs) > 0 else 0.0,
+        "median_prob_benign": float(np.median(benign_probs)) if len(benign_probs) > 0 else 0.0,
+        "median_prob_attack": float(np.median(attack_probs)) if len(attack_probs) > 0 else 0.0,
+        "min_prob": float(np.min(y_prob)),
+        "max_prob": float(np.max(y_prob)),
+        "attack_rate": float(np.mean(y_true)),
+        "pred_attack_rate_at_05": float(np.mean(y_prob >= 0.5)),
+    }
+    return diag
 
 
 # ─── Training epoch with diagnostics ──────────────────────────────────────────
@@ -308,13 +343,16 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda) if total_steps > 0 else None
 
-    # ── Training loop with best checkpoint, diagnostics, early stopping ────
-    early_stop_metric = getattr(config, "early_stop_metric", "roc_auc")
+    # ── Training loop with multi-checkpoint, diagnostics, early stopping ────
+    checkpoint_metric = getattr(config, "checkpoint_metric", "best_f1")
     patience = getattr(config, "patience", 4)
-    best_metric_value = 0.0
-    best_epoch = 0
-    best_state = None
-    best_val_threshold = 0.5
+    
+    # Track 4 separate best checkpoints
+    best_roc_auc = {"value": 0.0, "epoch": 0, "state": None, "threshold": 0.5}
+    best_pr_auc = {"value": 0.0, "epoch": 0, "state": None, "threshold": 0.5}
+    best_f1 = {"value": 0.0, "epoch": 0, "state": None, "threshold": 0.5}
+    best_val_loss = {"value": float("inf"), "epoch": 0, "state": None, "threshold": 0.5}
+    
     no_improve = 0
     epoch_history: list[dict] = []
     nan_abort = False
@@ -322,7 +360,7 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
     print(f"\n{'─'*70}")
     print(f"Training config: lr={config.lr:.1e} | grad_clip={grad_clip} | "
           f"warmup={warmup_epochs} | patience={patience}")
-    print(f"Early stopping metric: {early_stop_metric} | "
+    print(f"Checkpoint/early stop metric: {checkpoint_metric} | "
           f"Attack class weight: {'disabled' if class_weight_tensor is None else f'{attack_weight:.2f}'}")
     print(f"{'─'*70}\n")
 
@@ -346,6 +384,12 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
         val_best_thr, val_best_f1 = _find_best_threshold_fine(val_targets, val_probs)
         val_f1_at_05 = val_metrics["f1_score"]  # F1 at default 0.5
 
+        # Threshold boundary warnings
+        if val_best_thr <= 0.002:
+            print(f"       ⚠️  Best threshold {val_best_thr:.4f} is at lower boundary — consider extending search")
+        if val_best_thr >= 0.94:
+            print(f"       ⚠️  Best threshold {val_best_thr:.4f} is at upper boundary — consider extending search")
+
         # Re-compute metrics at the best threshold for logging
         val_preds_tuned = binary_predictions_from_proba(val_probs, val_best_thr)
         val_metrics_tuned = calculate_comprehensive_metrics(val_targets, val_preds_tuned, val_probs)
@@ -356,25 +400,44 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
         fn = int(((val_preds_tuned == 0) & (val_targets == 1)).sum())
         tp = int(((val_preds_tuned == 1) & (val_targets == 1)).sum())
 
+        # Probability diagnostics
+        prob_diag = _compute_prob_diagnostics(val_probs, val_targets)
+
         current_lr = optimizer.param_groups[0]["lr"]
 
-        # Determine monitored metric value
-        if early_stop_metric == "f1":
+        # Determine monitored metric value for early stopping
+        if checkpoint_metric == "best_f1":
             current_monitor = val_best_f1
-        else:
+        elif checkpoint_metric == "pr_auc":
+            current_monitor = val_metrics_tuned["auc_pr"]
+        elif checkpoint_metric == "val_loss":
+            current_monitor = -val_loss  # negative so "higher is better" logic works
+        else:  # "roc_auc"
             current_monitor = val_metrics_tuned["auc_roc"]
 
         # ── Logging ────────────────────────────────────────────────────────
         print(
             f"Epoch {epoch:02d} | Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} | "
             f"ROC-AUC {val_metrics_tuned['auc_roc']:.4f} | PR-AUC {val_metrics_tuned['auc_pr']:.4f} | "
-            f"F1@0.5 {val_f1_at_05:.4f} | Best-F1 {val_best_f1:.4f}@{val_best_thr:.2f} | "
+            f"F1@0.5 {val_f1_at_05:.4f} | Best-F1 {val_best_f1:.4f}@{val_best_thr:.3f} | "
             f"P {val_metrics_tuned['precision']:.4f} R {val_metrics_tuned['recall']:.4f} | "
             f"LR {current_lr:.2e}"
         )
         print(
-            f"       Grad norm: pre-clip={grad_norm_pre:.2f} post-clip={grad_norm_post:.2f} | "
+            f"       Grad norm: pre={grad_norm_pre:.2f} post={grad_norm_post:.2f} | "
             f"CM: TN={tn} FP={fp} FN={fn} TP={tp}"
+        )
+        print(
+            f"       Prob stats: benign mean={prob_diag['mean_prob_benign']:.4f} "
+            f"med={prob_diag['median_prob_benign']:.4f} | "
+            f"attack mean={prob_diag['mean_prob_attack']:.4f} "
+            f"med={prob_diag['median_prob_attack']:.4f} | "
+            f"range=[{prob_diag['min_prob']:.4f}, {prob_diag['max_prob']:.4f}]"
+        )
+        print(
+            f"       Val attack rate: {prob_diag['attack_rate']:.3f} | "
+            f"Pred attack@0.5: {prob_diag['pred_attack_rate_at_05']:.3f} | "
+            f"Pred attack@{val_best_thr:.3f}: {np.mean(val_probs >= val_best_thr):.3f}"
         )
 
         epoch_history.append({
@@ -387,46 +450,98 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
             "tn": tn, "fp": fp, "fn": fn, "tp": tp,
         })
 
-        # ── Best checkpoint saving ────────────────────────────────────────
-        if current_monitor > best_metric_value:
-            best_metric_value = current_monitor
-            best_epoch = epoch
-            best_val_threshold = val_best_thr
-            no_improve = 0
-            state_dict = model.module.state_dict() if isinstance(model, DataParallel) else model.state_dict()
-            preprocess_state = {
-                "type": "standard_scaler",
-                "medians": medians.to_dict(),
-                "mean": scaler.mean_.tolist(),
-                "scale": scaler.scale_.tolist(),
-                "log1p_columns": prep_meta["log1p_columns"],
-                "indicator_source_columns": prep_meta["indicator_source_columns"],
-                "csv_columns": prep_meta["csv_feature_cols"],
-            }
-            best_state = {
-                "model_state_dict": state_dict,
+        # ── Multi-checkpoint saving ────────────────────────────────────────
+        state_dict = model.module.state_dict() if isinstance(model, DataParallel) else model.state_dict()
+        preprocess_state = {
+            "type": "standard_scaler",
+            "medians": medians.to_dict(),
+            "mean": scaler.mean_.tolist(),
+            "scale": scaler.scale_.tolist(),
+            "log1p_columns": prep_meta["log1p_columns"],
+            "indicator_source_columns": prep_meta["indicator_source_columns"],
+            "csv_columns": prep_meta["csv_feature_cols"],
+        }
+        
+        def _make_checkpoint():
+            return {
+                "model_state_dict": state_dict.copy(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "metrics": val_metrics_tuned,
                 "config": config.__dict__,
                 "feature_columns": feature_cols,
                 "preprocessor": preprocess_state,
                 "model_type": "cnn_transformer",
-                "best_epoch": best_epoch,
-                "best_threshold": best_val_threshold,
-                "best_val_f1": val_best_f1,
-                "best_val_roc_auc": val_metrics_tuned["auc_roc"],
-                "best_val_pr_auc": val_metrics_tuned["auc_pr"],
+                "epoch": epoch,
+                "threshold": val_best_thr,
+                "val_f1": val_best_f1,
+                "val_roc_auc": val_metrics_tuned["auc_roc"],
+                "val_pr_auc": val_metrics_tuned["auc_pr"],
+                "val_loss": val_loss,
             }
-            print(f"       ✓ New best ({early_stop_metric}={current_monitor:.4f}) — saved checkpoint")
+        
+        # Save best for each metric
+        if val_metrics_tuned["auc_roc"] > best_roc_auc["value"]:
+            best_roc_auc["value"] = val_metrics_tuned["auc_roc"]
+            best_roc_auc["epoch"] = epoch
+            best_roc_auc["state"] = _make_checkpoint()
+            best_roc_auc["threshold"] = val_best_thr
+            print(f"       ✓ New best ROC-AUC: {best_roc_auc['value']:.4f}")
+        
+        if val_metrics_tuned["auc_pr"] > best_pr_auc["value"]:
+            best_pr_auc["value"] = val_metrics_tuned["auc_pr"]
+            best_pr_auc["epoch"] = epoch
+            best_pr_auc["state"] = _make_checkpoint()
+            best_pr_auc["threshold"] = val_best_thr
+            print(f"       ✓ New best PR-AUC: {best_pr_auc['value']:.4f}")
+        
+        if val_best_f1 > best_f1["value"]:
+            best_f1["value"] = val_best_f1
+            best_f1["epoch"] = epoch
+            best_f1["state"] = _make_checkpoint()
+            best_f1["threshold"] = val_best_thr
+            print(f"       ✓ New best F1: {best_f1['value']:.4f} @ threshold {val_best_thr:.3f}")
+        
+        if val_loss < best_val_loss["value"]:
+            best_val_loss["value"] = val_loss
+            best_val_loss["epoch"] = epoch
+            best_val_loss["state"] = _make_checkpoint()
+            best_val_loss["threshold"] = val_best_thr
+            print(f"       ✓ New best val loss: {best_val_loss['value']:.4f}")
+
+        # Early stopping based on checkpoint_metric
+        metric_improved = False
+        if checkpoint_metric == "best_f1" and best_f1["epoch"] == epoch:
+            metric_improved = True
+        elif checkpoint_metric == "pr_auc" and best_pr_auc["epoch"] == epoch:
+            metric_improved = True
+        elif checkpoint_metric == "val_loss" and best_val_loss["epoch"] == epoch:
+            metric_improved = True
+        elif checkpoint_metric == "roc_auc" and best_roc_auc["epoch"] == epoch:
+            metric_improved = True
+
+        if metric_improved:
+            no_improve = 0
         else:
             no_improve += 1
             if no_improve >= patience:
+                if checkpoint_metric == "best_f1":
+                    best_val = best_f1["value"]
+                    best_ep = best_f1["epoch"]
+                elif checkpoint_metric == "pr_auc":
+                    best_val = best_pr_auc["value"]
+                    best_ep = best_pr_auc["epoch"]
+                elif checkpoint_metric == "val_loss":
+                    best_val = best_val_loss["value"]
+                    best_ep = best_val_loss["epoch"]
+                else:
+                    best_val = best_roc_auc["value"]
+                    best_ep = best_roc_auc["epoch"]
                 print(f"\nEarly stopping at epoch {epoch} (patience={patience}, "
-                      f"best {early_stop_metric}={best_metric_value:.4f} at epoch {best_epoch})")
+                      f"best {checkpoint_metric}={best_val:.4f} at epoch {best_ep})")
                 break
 
     # ── Handle NaN abort ───────────────────────────────────────────────────
-    if nan_abort and best_state is None:
+    if nan_abort and best_f1["state"] is None:
         print("\n⚠️  Training aborted due to NaN/Inf before any valid checkpoint was saved.")
         diag_path = os.path.join(config.output_dir, "cnn_transformer_nan_diagnostic.txt")
         with open(diag_path, "w") as f:
@@ -441,10 +556,13 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
 
     # ── Plot training curves ──────────────────────────────────────────────
     if epoch_history:
-        if best_state is not None:
-            best_state["epoch_history"] = epoch_history
+        # Add history to all checkpoints
+        for ckpt in [best_roc_auc, best_pr_auc, best_f1, best_val_loss]:
+            if ckpt["state"] is not None:
+                ckpt["state"]["epoch_history"] = epoch_history
+        
         epochs_arr = [h["epoch"] for h in epoch_history]
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        _, axes = plt.subplots(1, 3, figsize=(18, 5))
 
         axes[0].plot(epochs_arr, [h["train_loss"] for h in epoch_history], label="Train Loss")
         axes[0].plot(epochs_arr, [h["val_loss"] for h in epoch_history], label="Val Loss")
@@ -453,8 +571,8 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
 
         axes[1].plot(epochs_arr, [h["roc_auc"] for h in epoch_history], label="Val ROC-AUC", color="tab:orange")
         axes[1].plot(epochs_arr, [h["pr_auc"] for h in epoch_history], label="Val PR-AUC", color="tab:purple", linestyle="--")
-        axes[1].axhline(y=best_metric_value, color="r", linestyle="--", alpha=0.5,
-                        label=f"Best {early_stop_metric}={best_metric_value:.4f}")
+        if best_f1["epoch"] > 0:
+            axes[1].axvline(x=best_f1["epoch"], color="g", linestyle=":", alpha=0.5, label=f"Best F1 @ep{best_f1['epoch']}")
         axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("AUC")
         axes[1].set_title("CNN-Transformer — ROC-AUC & PR-AUC"); axes[1].legend(); axes[1].grid(True)
         axes[1].set_ylim(0, 1.05)
@@ -472,23 +590,37 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
         plt.show()
         print(f"Saved training curves -> {curve_path}")
 
-    if best_state is None:
+    if best_f1["state"] is None:
         print("Training failed to improve beyond initialization.")
         return None
 
-    # ── Reload best checkpoint for final evaluation ───────────────────────
-    print(f"\nReloading best checkpoint from epoch {best_epoch} "
-          f"({early_stop_metric}={best_metric_value:.4f})")
+    # ── Print checkpoint summary ───────────────────────────────────────────
+    print(f"\n{'='*70}")
+    print("CHECKPOINT SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Best ROC-AUC:  {best_roc_auc['value']:.4f} @ epoch {best_roc_auc['epoch']}")
+    print(f"  Best PR-AUC:   {best_pr_auc['value']:.4f} @ epoch {best_pr_auc['epoch']}")
+    print(f"  Best F1:       {best_f1['value']:.4f} @ epoch {best_f1['epoch']} (threshold {best_f1['threshold']:.3f})")
+    print(f"  Best Val Loss: {best_val_loss['value']:.4f} @ epoch {best_val_loss['epoch']}")
+    print(f"{'='*70}\n")
+
+    # ── Select checkpoint for final test evaluation ───────────────────────
+    # Default to best_f1 checkpoint
+    selected_checkpoint = best_f1
+    selected_name = "best_f1"
+    
+    print(f"Loading checkpoint: {selected_name} (epoch {selected_checkpoint['epoch']})")
     final_model = model.module if isinstance(model, DataParallel) else model
-    final_model.load_state_dict(best_state["model_state_dict"])
+    final_model.load_state_dict(selected_checkpoint["state"]["model_state_dict"])
+    selected_threshold = selected_checkpoint["threshold"]
 
     # ── Final evaluation on held-out test set ─────────────────────────────
     if test_loader is not None and len(test_loader.dataset) > 0:
-        test_loss, test_metrics, test_probs, test_targets = _eval_epoch_with_threshold(
-            model, test_loader, criterion, device, threshold=best_val_threshold
+        _, test_metrics, test_probs, test_targets = _eval_epoch_with_threshold(
+            model, test_loader, criterion, device, threshold=selected_threshold
         )
         # Test confusion matrix
-        test_preds = binary_predictions_from_proba(test_probs, best_val_threshold)
+        test_preds = binary_predictions_from_proba(test_probs, selected_threshold)
         test_tn = int(((test_preds == 0) & (test_targets == 0)).sum())
         test_fp = int(((test_preds == 1) & (test_targets == 0)).sum())
         test_fn = int(((test_preds == 0) & (test_targets == 1)).sum())
@@ -498,8 +630,8 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
             f"\n{'='*70}\n"
             f"  TEST SET RESULTS (held-out, never used for training/validation)\n"
             f"{'='*70}\n"
-            f"  Best Epoch:      {best_epoch}\n"
-            f"  Threshold:       {best_val_threshold:.4f} (tuned on validation, max F1)\n"
+            f"  Checkpoint:      {selected_name} (epoch {selected_checkpoint['epoch']})\n"
+            f"  Threshold:       {selected_threshold:.4f} (tuned on validation, max F1)\n"
             f"  ROC-AUC:         {test_metrics['auc_roc']:.4f}\n"
             f"  PR-AUC:          {test_metrics['auc_pr']:.4f}\n"
             f"  F1-Score:        {test_metrics['f1_score']:.4f}\n"
@@ -511,14 +643,23 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
             f"    FN={test_fn:>8,}  TP={test_tp:>8,}\n"
             f"{'='*70}"
         )
-        best_state["test_metrics"] = test_metrics
-        best_state["test_confusion_matrix"] = {"tn": test_tn, "fp": test_fp, "fn": test_fn, "tp": test_tp}
+        selected_checkpoint["state"]["test_metrics"] = test_metrics
+        selected_checkpoint["state"]["test_confusion_matrix"] = {"tn": test_tn, "fp": test_fp, "fn": test_fn, "tp": test_tp}
     else:
         print("No held-out test set configured; skipping test evaluation.")
 
+    # ── Save all checkpoints ───────────────────────────────────────────────
+    # Save primary checkpoint (best_f1)
     model_path = os.path.join(config.output_dir, "cnn_transformer_ids.pth")
-    torch.save(best_state, model_path)
-    print(f"Saved CNN-Transformer checkpoint -> {model_path}")
+    torch.save(best_f1["state"], model_path)
+    print(f"\nSaved primary checkpoint (best F1) -> {model_path}")
+    
+    # Save alternative checkpoints
+    for name, ckpt in [("roc_auc", best_roc_auc), ("pr_auc", best_pr_auc), ("val_loss", best_val_loss)]:
+        if ckpt["state"] is not None:
+            alt_path = os.path.join(config.output_dir, f"cnn_transformer_{name}.pth")
+            torch.save(ckpt["state"], alt_path)
+            print(f"Saved {name} checkpoint (epoch {ckpt['epoch']}) -> {alt_path}")
 
     preprocess_artifacts = {
         "feature_columns": feature_cols,

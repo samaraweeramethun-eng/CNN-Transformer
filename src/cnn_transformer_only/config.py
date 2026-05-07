@@ -32,7 +32,7 @@ class CNNTransformerConfig:
     skew_threshold: float = 5.0
     near_dup_decimals: int = 3  # round features to N decimals before dedup (0 = disabled)
     warmup_epochs: int = 2  # LR warmup epochs (critical for Transformer stability)
-    patience: int = 4  # early stopping patience (epochs without ROC-AUC improvement)
-    early_stop_metric: str = "roc_auc"  # metric to monitor: "roc_auc" or "f1"
+    patience: int = 4  # early stopping patience (epochs without improvement)
+    checkpoint_metric: str = "best_f1"  # primary metric for checkpoint/early stop: "best_f1", "roc_auc", "pr_auc", "val_loss"
     attack_class_weight: float = 0.0  # 0 = disabled (use balanced data only); >0 overrides
     grad_clip: float = 0.5  # max gradient norm for clipping
