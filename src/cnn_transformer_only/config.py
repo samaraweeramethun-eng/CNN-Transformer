@@ -13,7 +13,7 @@ class CNNTransformerConfig:
     epochs: int = 25
     batch_size: int = 1024
     val_batch_size: int = 2048
-    lr: float = 1e-4
+    lr: float = 3e-5
     weight_decay: float = 5e-3
     label_smoothing: float = 0.1
     conv_channels: int = 64
@@ -31,5 +31,5 @@ class CNNTransformerConfig:
     correlation_threshold: float = 0.95
     skew_threshold: float = 5.0
     near_dup_decimals: int = 3  # round features to N decimals before dedup (0 = disabled)
-    warmup_epochs: int = 5  # LR warmup epochs (critical for Transformer stability)
-    patience: int = 7  # early stopping patience (epochs without ROC-AUC improvement)
+    warmup_epochs: int = 2  # LR warmup epochs (critical for Transformer stability)
+    patience: int = 4  # early stopping patience (epochs without ROC-AUC improvement)

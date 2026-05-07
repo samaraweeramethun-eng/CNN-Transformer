@@ -49,7 +49,7 @@ def _train_epoch(model, loader, criterion, optimizer, scheduler, device):
         logits = model(data)
         loss = criterion(logits, target)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
