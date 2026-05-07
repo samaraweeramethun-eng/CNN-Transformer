@@ -504,8 +504,8 @@ def prepare_training_data(
                     "attack_pct": block_attack_pct,
                 })
             
-            # Print first 10 blocks
-            print("  Attack % per block (first 10):")
+            # Print first 10 blocks (before assignment)
+            print("  Attack % per block (before assignment, first 10):")
             for stat in block_stats[:10]:
                 print(f"    Block {stat['block_id']:2d}: {stat['size']:>6,} rows, "
                       f"{stat['attack_pct']:>5.1f}% attack")
@@ -622,11 +622,31 @@ def prepare_training_data(
             X_test_raw = X_np[test_idx]
             y_test = y[test_idx]
             
+            # Store test block assignments for per-block evaluation
+            test_block_map = source_groups[test_idx]
+            
             print(f"  Optimized assignment: {len(train_block_ids)} train blocks, "
                   f"{len(val_block_ids)} val blocks, {len(test_block_ids)} test blocks")
+            
+            # ── Detailed block diagnostics with split assignments ─────────────
+            print(f"\n  Detailed block assignment:")
+            print(f"  {'Block':<7} {'Rows':>8} {'Attack%':>8} {'Split':<8}")
+            print(f"  {'-'*7} {'-'*8} {'-'*8} {'-'*8}")
+            for stat in block_stats:
+                block_id = stat['block_id']
+                if block_id in train_block_ids:
+                    split = 'train'
+                elif block_id in val_block_ids:
+                    split = 'val'
+                elif block_id in test_block_ids:
+                    split = 'test'
+                else:
+                    split = 'unknown'
+                print(f"  {block_id:<7} {stat['size']:>8,} {stat['attack_pct']:>7.1f}% {split:<8}")
         
         else:
             # Multiple CSV sources: use GroupShuffleSplit (original logic)
+            test_block_map = None  # No block assignments for GroupShuffleSplit path
             gss = GroupShuffleSplit(
                 n_splits=1, test_size=holdout_ratio,
                 random_state=config.random_state,
@@ -696,7 +716,9 @@ def prepare_training_data(
         
         # ── Leakage verification ───────────────────────────────────────────
         print(f"\n  Leakage verification:")
-        # Check for exact duplicates across splits
+        
+        # Check 1: Exact duplicates across splits
+        print(f"  [1/3] Checking exact duplicates...")
         train_set = set(map(tuple, X_train_raw))
         val_set = set(map(tuple, X_val_raw)) if len(X_val_raw) > 0 else set()
         test_set = set(map(tuple, X_test_raw)) if len(X_test_raw) > 0 else set()
@@ -705,17 +727,127 @@ def prepare_training_data(
         train_test_overlap = len(train_set & test_set)
         val_test_overlap = len(val_set & test_set)
         
+        exact_dup_pass = True
         if train_val_overlap > 0:
             print(f"    ⚠️  {train_val_overlap} exact duplicates between train and val")
+            exact_dup_pass = False
         if train_test_overlap > 0:
             print(f"    ⚠️  {train_test_overlap} exact duplicates between train and test")
+            exact_dup_pass = False
         if val_test_overlap > 0:
             print(f"    ⚠️  {val_test_overlap} exact duplicates between val and test")
+            exact_dup_pass = False
         
-        if train_val_overlap == 0 and train_test_overlap == 0 and val_test_overlap == 0:
+        if exact_dup_pass:
             print(f"    ✓ No exact duplicates across splits")
+        
+        # Check 2: Near-duplicates using hash-based approach with near_dup_decimals
+        nd_dec = getattr(config, 'near_dup_decimals', 3)
+        if nd_dec > 0:
+            print(f"  [2/3] Checking near-duplicates (rounded to {nd_dec} decimals)...")
+            
+            def _hash_rounded(X_arr, decimals):
+                """Hash each row after rounding to N decimals."""
+                X_rounded = np.round(np.nan_to_num(X_arr, nan=-999.0), decimals=decimals)
+                return set(map(tuple, X_rounded))
+            
+            train_hash = _hash_rounded(X_train_raw, nd_dec)
+            val_hash = _hash_rounded(X_val_raw, nd_dec) if len(X_val_raw) > 0 else set()
+            test_hash = _hash_rounded(X_test_raw, nd_dec) if len(X_test_raw) > 0 else set()
+            
+            near_train_val = len(train_hash & val_hash)
+            near_train_test = len(train_hash & test_hash)
+            near_val_test = len(val_hash & test_hash)
+            
+            near_dup_pass = True
+            if near_train_val > 0:
+                pct = 100.0 * near_train_val / max(len(val_hash), 1)
+                print(f"    ⚠️  {near_train_val} near-duplicates between train and val ({pct:.2f}% of val)")
+                near_dup_pass = False
+            if near_train_test > 0:
+                pct = 100.0 * near_train_test / max(len(test_hash), 1)
+                print(f"    ⚠️  {near_train_test} near-duplicates between train and test ({pct:.2f}% of test)")
+                near_dup_pass = False
+            if near_val_test > 0:
+                pct = 100.0 * near_val_test / max(len(val_hash), 1)
+                print(f"    ⚠️  {near_val_test} near-duplicates between val and test ({pct:.2f}% of val)")
+                near_dup_pass = False
+            
+            if near_dup_pass:
+                print(f"    ✓ No near-duplicates across splits (at {nd_dec} decimals)")
+        else:
+            near_dup_pass = True
+            print(f"  [2/3] Near-duplicate check disabled (near_dup_decimals=0)")
+        
+        # Check 3: Nearest-neighbor leakage diagnostic
+        print(f"  [3/3] Checking nearest-neighbor distances (sample-based)...")
+        from sklearn.neighbors import NearestNeighbors
+        
+        # Sample to keep memory manageable
+        rng_nn = np.random.RandomState(config.random_state)
+        n_train_sample = min(20000, len(X_train_raw))
+        n_val_sample = min(5000, len(X_val_raw)) if len(X_val_raw) > 0 else 0
+        n_test_sample = min(5000, len(X_test_raw)) if len(X_test_raw) > 0 else 0
+        
+        train_idx_nn = rng_nn.choice(len(X_train_raw), n_train_sample, replace=False)
+        X_train_sample = X_train_raw[train_idx_nn]
+        
+        # Standardize samples (just for distance computation)
+        from sklearn.preprocessing import StandardScaler
+        scaler_nn = StandardScaler()
+        X_train_sample_scaled = scaler_nn.fit_transform(X_train_sample)
+        
+        nn_pass = True
+        for split_name, X_split in [("val", X_val_raw), ("test", X_test_raw)]:
+            if len(X_split) == 0:
+                continue
+            
+            n_sample = n_val_sample if split_name == "val" else n_test_sample
+            split_idx = rng_nn.choice(len(X_split), n_sample, replace=False)
+            X_split_sample = X_split[split_idx]
+            X_split_sample_scaled = scaler_nn.transform(X_split_sample)
+            
+            nn = NearestNeighbors(n_neighbors=1, metric='euclidean', n_jobs=-1)
+            nn.fit(X_train_sample_scaled)
+            distances, _ = nn.kneighbors(X_split_sample_scaled)
+            distances = distances.ravel()
+            
+            min_dist = float(distances.min())
+            median_dist = float(np.median(distances))
+            p25 = float(np.percentile(distances, 25))
+            
+            # Check thresholds
+            very_close = int((distances < 0.01).sum())
+            pct_very_close = 100.0 * very_close / len(distances)
+            
+            print(f"    {split_name.upper()} ({n_sample} samples vs {n_train_sample} train):")
+            print(f"      Min dist:    {min_dist:.6f}")
+            print(f"      25th pct:    {p25:.6f}")
+            print(f"      Median:      {median_dist:.6f}")
+            print(f"      < 0.01:      {very_close}/{len(distances)} ({pct_very_close:.1f}%)")
+            
+            if pct_very_close > 10.0:
+                print(f"      ⚠️  >10% of {split_name} samples very close to training data (possible leakage)")
+                nn_pass = False
+            elif pct_very_close > 5.0:
+                print(f"      ⚠️  {pct_very_close:.1f}% of {split_name} samples very close to training (borderline)")
+            else:
+                print(f"      ✓ Distance distribution looks reasonable")
+        
+        # Summary
+        print(f"\n  Leakage check summary:")
+        print(f"    Exact duplicates:       {'✓ PASS' if exact_dup_pass else '✗ FAIL'}")
+        print(f"    Near-duplicates:        {'✓ PASS' if near_dup_pass else '✗ FAIL'}")
+        print(f"    Nearest-neighbor:       {'✓ PASS' if nn_pass else '✗ FAIL'}")
+        
+        leakage_pass = exact_dup_pass and near_dup_pass and nn_pass
+        if leakage_pass:
+            print(f"    Overall:                ✓ ALL CHECKS PASSED")
+        else:
+            print(f"    Overall:                ✗ SOME CHECKS FAILED (review warnings above)")
 
     if not split_done:
+        test_block_map = None  # No block assignments for non-grouped split
         X_train_raw, X_holdout, y_train, y_holdout = train_test_split(
             X_np, y, test_size=holdout_ratio,
             stratify=y, random_state=config.random_state,
@@ -915,4 +1047,5 @@ def prepare_training_data(
         X_train, X_val, X_test,
         y_train, y_val, y_test,
         scaler, train_medians, feature_cols, preprocess_meta,
+        test_block_map,  # NEW: block assignments for test set (or None)
     )

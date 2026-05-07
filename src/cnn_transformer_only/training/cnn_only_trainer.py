@@ -140,7 +140,7 @@ def train_cnn_classifier(config: CNNTransformerConfig | None = None):
 
     print("Running enhanced preprocessing pipeline...")
     (X_train, X_val, X_test, y_train, y_val, y_test,
-     scaler, medians, feature_cols, prep_meta) = prepare_training_data(
+     scaler, medians, feature_cols, prep_meta, test_block_map) = prepare_training_data(
         X, y, feature_cols, config, source_groups=source_groups,
     )
     del X; gc.collect()
@@ -318,13 +318,21 @@ def train_cnn_classifier(config: CNNTransformerConfig | None = None):
     if test_loader is not None and len(test_loader.dataset) > 0:
         final_model_eval = model.module if isinstance(model, DataParallel) else model
         final_model_eval.load_state_dict(best_state["model_state_dict"])
-        test_loss, test_metrics, _, _ = _eval_epoch_with_threshold(
+        test_loss, test_metrics, test_probs, test_targets = _eval_epoch_with_threshold(
             model, test_loader, criterion, device, threshold=best_threshold
         )
+        
+        # Test confusion matrix
+        test_preds = binary_predictions_from_proba(test_probs, best_threshold)
+        test_tn = int(((test_preds == 0) & (test_targets == 0)).sum())
+        test_fp = int(((test_preds == 1) & (test_targets == 0)).sum())
+        test_fn = int(((test_preds == 0) & (test_targets == 1)).sum())
+        test_tp = int(((test_preds == 1) & (test_targets == 1)).sum())
+        
         print(
-            f"\n{'='*60}\n"
+            f"\n{'='*70}\n"
             f"CNN CLASSIFIER — TEST SET RESULTS\n"
-            f"{'='*60}\n"
+            f"{'='*70}\n"
             f"  Loss:      {test_loss:.4f}\n"
             f"  Threshold: {best_threshold:.4f} (tuned on validation, max F1)\n"
             f"  ROC-AUC:   {test_metrics['auc_roc']:.4f}\n"
@@ -333,9 +341,91 @@ def train_cnn_classifier(config: CNNTransformerConfig | None = None):
             f"  Precision: {test_metrics['precision']:.4f}\n"
             f"  Recall:    {test_metrics['recall']:.4f}\n"
             f"  Accuracy:  {test_metrics['accuracy']:.4f}\n"
-            f"{'='*60}"
+            f"  Confusion Matrix:\n"
+            f"    TN={test_tn:>8,}  FP={test_fp:>8,}\n"
+            f"    FN={test_fn:>8,}  TP={test_tp:>8,}\n"
+            f"{'='*70}"
         )
         best_state["test_metrics"] = test_metrics
+        best_state["test_confusion_matrix"] = {"tn": test_tn, "fp": test_fp, "fn": test_fn, "tp": test_tp}
+        
+        # ── Per-block evaluation (if block assignments available) ─────────
+        if test_block_map is not None:
+            print(f"\n{'='*70}")
+            print(f"  PER-BLOCK TEST EVALUATION")
+            print(f"{'='*70}")
+            
+            unique_blocks = np.unique(test_block_map)
+            print(f"  Evaluating {len(unique_blocks)} test blocks individually...")
+            
+            block_results = []
+            for block_id in unique_blocks:
+                block_mask = test_block_map == block_id
+                block_targets = test_targets[block_mask]
+                block_probs = test_probs[block_mask]
+                block_preds = test_preds[block_mask]
+                
+                if len(block_targets) == 0:
+                    continue
+                
+                # Compute metrics for this block
+                block_metrics = calculate_comprehensive_metrics(
+                    block_targets,
+                    block_preds,
+                    block_probs
+                )
+                
+                # Confusion matrix
+                b_tn = int(((block_preds == 0) & (block_targets == 0)).sum())
+                b_fp = int(((block_preds == 1) & (block_targets == 0)).sum())
+                b_fn = int(((block_preds == 0) & (block_targets == 1)).sum())
+                b_tp = int(((block_preds == 1) & (block_targets == 1)).sum())
+                
+                block_results.append({
+                    "block_id": int(block_id),
+                    "n_samples": len(block_targets),
+                    "attack_pct": float(block_targets.mean() * 100),
+                    "roc_auc": block_metrics['auc_roc'],
+                    "pr_auc": block_metrics['auc_pr'],
+                    "f1": block_metrics['f1_score'],
+                    "precision": block_metrics['precision'],
+                    "recall": block_metrics['recall'],
+                    "tn": b_tn, "fp": b_fp, "fn": b_fn, "tp": b_tp,
+                })
+            
+            # Print results
+            print(f"\n  {'Block':<7} {'Samples':>8} {'Attack%':>8} {'ROC-AUC':>8} {'PR-AUC':>8} {'F1':>8} {'Prec':>8} {'Rec':>8}")
+            print(f"  {'-'*7} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+            
+            for res in block_results:
+                print(f"  {res['block_id']:<7} {res['n_samples']:>8,} {res['attack_pct']:>7.1f}% "
+                      f"{res['roc_auc']:>8.4f} {res['pr_auc']:>8.4f} {res['f1']:>8.4f} "
+                      f"{res['precision']:>8.4f} {res['recall']:>8.4f}")
+            
+            # Check for problematic blocks
+            print(f"\n  Per-block diagnostics:")
+            low_f1_blocks = [r for r in block_results if r['f1'] < 0.80]
+            if low_f1_blocks:
+                print(f"    ⚠️  {len(low_f1_blocks)} block(s) with F1 < 0.80:")
+                for r in low_f1_blocks:
+                    print(f"      Block {r['block_id']}: F1={r['f1']:.4f}, samples={r['n_samples']}, attack%={r['attack_pct']:.1f}%")
+            else:
+                print(f"    ✓ All blocks have F1 ≥ 0.80")
+            
+            # Check variance across blocks
+            f1_scores = [r['f1'] for r in block_results]
+            f1_std = float(np.std(f1_scores))
+            f1_min = float(min(f1_scores))
+            f1_max = float(max(f1_scores))
+            print(f"    F1 range: [{f1_min:.4f}, {f1_max:.4f}], std={f1_std:.4f}")
+            if f1_std > 0.10:
+                print(f"    ⚠️  High F1 variance across blocks (std={f1_std:.4f})")
+            else:
+                print(f"    ✓ Consistent performance across blocks")
+            
+            best_state["per_block_results"] = block_results
+        else:
+            print(f"\n  Per-block evaluation: skipped (no block assignments available)")
     else:
         print("No held-out test set configured; skipping test evaluation.")
 
