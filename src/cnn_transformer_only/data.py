@@ -482,56 +482,181 @@ def prepare_training_data(
     if use_grouped:
         unique_groups = np.unique(source_groups)
         if len(unique_groups) < 3:
-            # Single/few CSV(s): create more sequential blocks (20 instead of 10)
-            # as a temporal proxy so GroupShuffleSplit keeps contiguous rows
-            # together, reducing near-duplicate leakage across splits.
-            # More blocks = finer-grained split control.
+            # Single/few CSV(s): create MORE sequential blocks (30-50)
+            # to enable finer-grained stratified block assignment.
+            # More blocks = better attack-rate balancing while keeping temporal grouping.
             n_orig = len(unique_groups)
-            n_blocks = max(10, min(20, len(y) // 5_000))
+            n_blocks = max(30, min(50, len(y) // 3_000))
             source_groups = (np.arange(len(y)) * n_blocks // len(y)).astype(np.int32)
             unique_groups = np.unique(source_groups)
             print(f"  Only {n_orig} CSV source(s); created {len(unique_groups)} "
-                  f"sequential blocks for grouped split (temporal proxy)")
+                  f"sequential blocks for stratified block assignment")
             
-            # Print attack percentage per block to diagnose class imbalance
-            print("  Attack % per block:")
-            for block_id in sorted(unique_groups)[:5]:  # show first 5 blocks
+            # Compute per-block statistics
+            block_stats = []
+            for block_id in unique_groups:
                 block_mask = source_groups == block_id
-                block_attack_pct = y[block_mask].mean() * 100
-                print(f"    Block {block_id}: {block_attack_pct:.1f}%")
-            if len(unique_groups) > 5:
-                print(f"    ... ({len(unique_groups) - 5} more blocks)")
-
-        gss = GroupShuffleSplit(
-            n_splits=1, test_size=holdout_ratio,
-            random_state=config.random_state,
-        )
-        trn_idx, hld_idx = next(gss.split(X_np, y, source_groups))
-        X_train_raw = X_np[trn_idx]
-        y_train = y[trn_idx]
-        X_holdout = X_np[hld_idx]
-        y_holdout = y[hld_idx]
-
-        if val_ratio > 0 and test_ratio > 0 and len(y_holdout) > 1:
-            test_frac = test_ratio / holdout_ratio
-            try:
-                X_val_raw, X_test_raw, y_val, y_test = train_test_split(
-                    X_holdout, y_holdout, test_size=test_frac,
-                    stratify=y_holdout, random_state=config.random_state,
+                block_size = int(block_mask.sum())
+                block_attack_pct = float(y[block_mask].mean() * 100)
+                block_stats.append({
+                    "block_id": int(block_id),
+                    "size": block_size,
+                    "attack_pct": block_attack_pct,
+                })
+            
+            # Print first 10 blocks
+            print("  Attack % per block (first 10):")
+            for stat in block_stats[:10]:
+                print(f"    Block {stat['block_id']:2d}: {stat['size']:>6,} rows, "
+                      f"{stat['attack_pct']:>5.1f}% attack")
+            if len(block_stats) > 10:
+                print(f"    ... ({len(block_stats) - 10} more blocks)")
+            
+            # ── Stratified block assignment optimizer ──────────────────────
+            # Assign blocks to train/val/test to minimize attack rate differences
+            # while respecting target split sizes
+            print(f"\n  Optimizing block assignment for balanced attack rates...")
+            
+            def _score_assignment(train_blocks, val_blocks, test_blocks, block_stats):
+                """Score a block assignment. Lower is better."""
+                train_size = sum(b["size"] for b in [block_stats[i] for i in train_blocks])
+                val_size = sum(b["size"] for b in [block_stats[i] for i in val_blocks])
+                test_size = sum(b["size"] for b in [block_stats[i] for i in test_blocks])
+                total_size = train_size + val_size + test_size
+                
+                if total_size == 0:
+                    return float("inf")
+                
+                train_pct = train_size / total_size
+                val_pct = val_size / total_size
+                test_pct = test_size / total_size
+                
+                # Compute attack rates
+                train_attack = sum(b["size"] * b["attack_pct"] for b in [block_stats[i] for i in train_blocks])
+                train_attack_pct = train_attack / max(train_size, 1)
+                val_attack = sum(b["size"] * b["attack_pct"] for b in [block_stats[i] for i in val_blocks])
+                val_attack_pct = val_attack / max(val_size, 1)
+                test_attack = sum(b["size"] * b["attack_pct"] for b in [block_stats[i] for i in test_blocks])
+                test_attack_pct = test_attack / max(test_size, 1)
+                
+                # Penalty for split size deviation (weight=10)
+                size_penalty = 10 * (
+                    abs(train_pct - train_ratio) +
+                    abs(val_pct - val_ratio) +
+                    abs(test_pct - test_ratio)
                 )
-            except ValueError:
-                X_val_raw, X_test_raw, y_val, y_test = train_test_split(
-                    X_holdout, y_holdout, test_size=test_frac,
-                    random_state=config.random_state,
+                
+                # Penalty for attack rate deviation (weight=1)
+                avg_attack_pct = (train_attack_pct + val_attack_pct + test_attack_pct) / 3
+                attack_penalty = (
+                    abs(train_attack_pct - avg_attack_pct) +
+                    abs(val_attack_pct - avg_attack_pct) +
+                    abs(test_attack_pct - avg_attack_pct)
                 )
-        elif val_ratio > 0:
-            X_val_raw, y_val = X_holdout, y_holdout
-            X_test_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
-            y_test = np.empty(0, dtype=np.int64)
+                
+                return size_penalty + attack_penalty
+            
+            # Sort blocks by attack percentage for stratified sampling
+            sorted_blocks = sorted(range(len(block_stats)), key=lambda i: block_stats[i]["attack_pct"])
+            
+            # Try greedy assignment: distribute blocks in round-robin fashion
+            # Start with blocks sorted by attack rate to ensure even distribution
+            best_score = float("inf")
+            best_assignment = None
+            
+            # Try multiple random seeds for robustness
+            rng = np.random.RandomState(config.random_state)
+            for seed_offset in range(10):
+                # Shuffle sorted blocks slightly to explore variations
+                shuffled = sorted_blocks.copy()
+                if seed_offset > 0:
+                    # Shuffle within windows of 3 blocks to maintain rough stratification
+                    for i in range(0, len(shuffled) - 2, 3):
+                        window = shuffled[i:i+3]
+                        rng.shuffle(window)
+                        shuffled[i:i+3] = window
+                
+                # Assign blocks in round-robin: train gets 70%, val gets 15%, test gets 15%
+                # Pattern: T T T T T T T V T T Test T T T ...
+                train_blocks = []
+                val_blocks = []
+                test_blocks = []
+                
+                for i, block_idx in enumerate(shuffled):
+                    # Every ~6.7 blocks → train, every ~46.7 blocks → val, every ~46.7 → test
+                    # Use cumulative logic to hit target ratios
+                    current_train = len(train_blocks)
+                    current_val = len(val_blocks)
+                    current_test = len(test_blocks)
+                    total_assigned = current_train + current_val + current_test + 1
+                    
+                    target_train = int(total_assigned * train_ratio + 0.5)
+                    target_val = int(total_assigned * val_ratio + 0.5)
+                    
+                    if current_train < target_train:
+                        train_blocks.append(block_idx)
+                    elif current_val < target_val:
+                        val_blocks.append(block_idx)
+                    else:
+                        test_blocks.append(block_idx)
+                
+                score = _score_assignment(train_blocks, val_blocks, test_blocks, block_stats)
+                if score < best_score:
+                    best_score = score
+                    best_assignment = (train_blocks, val_blocks, test_blocks)
+            
+            if best_assignment is None:
+                raise ValueError("Block assignment optimization failed")
+            
+            train_block_ids, val_block_ids, test_block_ids = best_assignment
+            
+            # Convert block IDs to row indices
+            trn_idx = np.where(np.isin(source_groups, train_block_ids))[0]
+            val_idx = np.where(np.isin(source_groups, val_block_ids))[0]
+            test_idx = np.where(np.isin(source_groups, test_block_ids))[0]
+            
+            X_train_raw = X_np[trn_idx]
+            y_train = y[trn_idx]
+            X_val_raw = X_np[val_idx]
+            y_val = y[val_idx]
+            X_test_raw = X_np[test_idx]
+            y_test = y[test_idx]
+            
+            print(f"  Optimized assignment: {len(train_block_ids)} train blocks, "
+                  f"{len(val_block_ids)} val blocks, {len(test_block_ids)} test blocks")
+        
         else:
-            X_test_raw, y_test = X_holdout, y_holdout
-            X_val_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
-            y_val = np.empty(0, dtype=np.int64)
+            # Multiple CSV sources: use GroupShuffleSplit (original logic)
+            gss = GroupShuffleSplit(
+                n_splits=1, test_size=holdout_ratio,
+                random_state=config.random_state,
+            )
+            trn_idx, hld_idx = next(gss.split(X_np, y, source_groups))
+            X_train_raw = X_np[trn_idx]
+            y_train = y[trn_idx]
+            X_holdout = X_np[hld_idx]
+            y_holdout = y[hld_idx]
+
+            if val_ratio > 0 and test_ratio > 0 and len(y_holdout) > 1:
+                test_frac = test_ratio / holdout_ratio
+                try:
+                    X_val_raw, X_test_raw, y_val, y_test = train_test_split(
+                        X_holdout, y_holdout, test_size=test_frac,
+                        stratify=y_holdout, random_state=config.random_state,
+                    )
+                except ValueError:
+                    X_val_raw, X_test_raw, y_val, y_test = train_test_split(
+                        X_holdout, y_holdout, test_size=test_frac,
+                        random_state=config.random_state,
+                    )
+            elif val_ratio > 0:
+                X_val_raw, y_val = X_holdout, y_holdout
+                X_test_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
+                y_test = np.empty(0, dtype=np.int64)
+            else:
+                X_test_raw, y_test = X_holdout, y_holdout
+                X_val_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
+                y_val = np.empty(0, dtype=np.int64)
 
         split_done = True
         
@@ -546,7 +671,7 @@ def prepare_training_data(
         val_atk_pct = y_val.mean() * 100 if len(y_val) > 0 else 0.0
         test_atk_pct = y_test.mean() * 100 if len(y_test) > 0 else 0.0
         
-        print(f"  Grouped split ({len(unique_groups)} groups) -> "
+        print(f"\n  Final split ({len(unique_groups)} groups) -> "
               f"train {len(y_train):,} ({train_pct:.1f}%, {trn_atk_pct:.1f}% attack), "
               f"val {len(y_val):,} ({val_pct:.1f}%, {val_atk_pct:.1f}% attack), "
               f"test {len(y_test):,} ({test_pct:.1f}%, {test_atk_pct:.1f}% attack)")
@@ -568,6 +693,27 @@ def prepare_training_data(
             print(f"  ⚠️  Val attack rate {val_atk_pct:.1f}% differs from train {trn_atk_pct:.1f}% by {abs(val_atk_pct - trn_atk_pct):.1f}pp")
         if len(y_test) > 0 and abs(test_atk_pct - trn_atk_pct) > 5.0:
             print(f"  ⚠️  Test attack rate {test_atk_pct:.1f}% differs from train {trn_atk_pct:.1f}% by {abs(test_atk_pct - trn_atk_pct):.1f}pp")
+        
+        # ── Leakage verification ───────────────────────────────────────────
+        print(f"\n  Leakage verification:")
+        # Check for exact duplicates across splits
+        train_set = set(map(tuple, X_train_raw))
+        val_set = set(map(tuple, X_val_raw)) if len(X_val_raw) > 0 else set()
+        test_set = set(map(tuple, X_test_raw)) if len(X_test_raw) > 0 else set()
+        
+        train_val_overlap = len(train_set & val_set)
+        train_test_overlap = len(train_set & test_set)
+        val_test_overlap = len(val_set & test_set)
+        
+        if train_val_overlap > 0:
+            print(f"    ⚠️  {train_val_overlap} exact duplicates between train and val")
+        if train_test_overlap > 0:
+            print(f"    ⚠️  {train_test_overlap} exact duplicates between train and test")
+        if val_test_overlap > 0:
+            print(f"    ⚠️  {val_test_overlap} exact duplicates between val and test")
+        
+        if train_val_overlap == 0 and train_test_overlap == 0 and val_test_overlap == 0:
+            print(f"    ✓ No exact duplicates across splits")
 
     if not split_done:
         X_train_raw, X_holdout, y_train, y_holdout = train_test_split(
