@@ -453,8 +453,25 @@ def prepare_training_data(
     csv_feature_cols = list(feature_cols)
 
     # ── 5. Split (grouped or stratified) ──────────────────────────────
-    val_ratio = getattr(config, "val_size", 0.1)
-    test_ratio = config.test_size
+    # Read split ratios from config (support both new and legacy field names)
+    train_ratio = getattr(config, "train_ratio", None)
+    val_ratio = getattr(config, "val_ratio", None)
+    test_ratio = getattr(config, "test_ratio", None)
+    
+    # Fallback to legacy field names if new ones not present
+    if train_ratio is None or val_ratio is None or test_ratio is None:
+        val_ratio = getattr(config, "val_size", 0.15)
+        test_ratio = getattr(config, "test_size", 0.15)
+        train_ratio = 1.0 - val_ratio - test_ratio
+    
+    # Validation check
+    ratio_sum = train_ratio + val_ratio + test_ratio
+    if not (0.999 < ratio_sum < 1.001):
+        raise ValueError(
+            f"Split ratios must sum to 1.0, got {ratio_sum:.4f} "
+            f"(train={train_ratio}, val={val_ratio}, test={test_ratio})"
+        )
+    
     holdout_ratio = val_ratio + test_ratio
     use_grouped = (
         getattr(config, "grouped_split", True)
@@ -465,15 +482,25 @@ def prepare_training_data(
     if use_grouped:
         unique_groups = np.unique(source_groups)
         if len(unique_groups) < 3:
-            # Single/few CSV(s): create sequential block groups as a
-            # temporal proxy so GroupShuffleSplit keeps contiguous rows
+            # Single/few CSV(s): create more sequential blocks (20 instead of 10)
+            # as a temporal proxy so GroupShuffleSplit keeps contiguous rows
             # together, reducing near-duplicate leakage across splits.
+            # More blocks = finer-grained split control.
             n_orig = len(unique_groups)
-            n_blocks = max(5, min(10, len(y) // 10_000))
+            n_blocks = max(10, min(20, len(y) // 5_000))
             source_groups = (np.arange(len(y)) * n_blocks // len(y)).astype(np.int32)
             unique_groups = np.unique(source_groups)
             print(f"  Only {n_orig} CSV source(s); created {len(unique_groups)} "
                   f"sequential blocks for grouped split (temporal proxy)")
+            
+            # Print attack percentage per block to diagnose class imbalance
+            print("  Attack % per block:")
+            for block_id in sorted(unique_groups)[:5]:  # show first 5 blocks
+                block_mask = source_groups == block_id
+                block_attack_pct = y[block_mask].mean() * 100
+                print(f"    Block {block_id}: {block_attack_pct:.1f}%")
+            if len(unique_groups) > 5:
+                print(f"    ... ({len(unique_groups) - 5} more blocks)")
 
         gss = GroupShuffleSplit(
             n_splits=1, test_size=holdout_ratio,
@@ -507,10 +534,40 @@ def prepare_training_data(
             y_val = np.empty(0, dtype=np.int64)
 
         split_done = True
-        trn_atk = y_train.sum() / len(y_train) * 100
+        
+        # Compute actual split percentages
+        total_samples = len(y_train) + len(y_val) + len(y_test)
+        train_pct = len(y_train) / total_samples * 100
+        val_pct = len(y_val) / total_samples * 100
+        test_pct = len(y_test) / total_samples * 100
+        
+        # Compute attack percentages
+        trn_atk_pct = y_train.mean() * 100
+        val_atk_pct = y_val.mean() * 100 if len(y_val) > 0 else 0.0
+        test_atk_pct = y_test.mean() * 100 if len(y_test) > 0 else 0.0
+        
         print(f"  Grouped split ({len(unique_groups)} groups) -> "
-              f"train {len(y_train):,} ({trn_atk:.1f}% attack), "
-              f"val {len(y_val):,}, test {len(y_test):,}")
+              f"train {len(y_train):,} ({train_pct:.1f}%, {trn_atk_pct:.1f}% attack), "
+              f"val {len(y_val):,} ({val_pct:.1f}%, {val_atk_pct:.1f}% attack), "
+              f"test {len(y_test):,} ({test_pct:.1f}%, {test_atk_pct:.1f}% attack)")
+        
+        # Warn if actual split differs from target by >5 percentage points
+        train_target_pct = train_ratio * 100
+        val_target_pct = val_ratio * 100
+        test_target_pct = test_ratio * 100
+        
+        if abs(train_pct - train_target_pct) > 5.0:
+            print(f"  ⚠️  Train split {train_pct:.1f}% differs from target {train_target_pct:.1f}% by {abs(train_pct - train_target_pct):.1f}pp")
+        if abs(val_pct - val_target_pct) > 5.0:
+            print(f"  ⚠️  Val split {val_pct:.1f}% differs from target {val_target_pct:.1f}% by {abs(val_pct - val_target_pct):.1f}pp")
+        if abs(test_pct - test_target_pct) > 5.0:
+            print(f"  ⚠️  Test split {test_pct:.1f}% differs from target {test_target_pct:.1f}% by {abs(test_pct - test_target_pct):.1f}pp")
+        
+        # Warn if validation or test attack % differs from train by >5 pp
+        if len(y_val) > 0 and abs(val_atk_pct - trn_atk_pct) > 5.0:
+            print(f"  ⚠️  Val attack rate {val_atk_pct:.1f}% differs from train {trn_atk_pct:.1f}% by {abs(val_atk_pct - trn_atk_pct):.1f}pp")
+        if len(y_test) > 0 and abs(test_atk_pct - trn_atk_pct) > 5.0:
+            print(f"  ⚠️  Test attack rate {test_atk_pct:.1f}% differs from train {trn_atk_pct:.1f}% by {abs(test_atk_pct - trn_atk_pct):.1f}pp")
 
     if not split_done:
         X_train_raw, X_holdout, y_train, y_holdout = train_test_split(
@@ -531,8 +588,34 @@ def prepare_training_data(
             X_test_raw, y_test = X_holdout, y_holdout
             X_val_raw = np.empty((0, X_np.shape[1]), dtype=np.float32)
             y_val = np.empty(0, dtype=np.int64)
-        print(f"  Stratified split -> train {len(y_train):,}, "
-              f"val {len(y_val):,}, test {len(y_test):,}")
+        
+        # Compute actual split percentages
+        total_samples = len(y_train) + len(y_val) + len(y_test)
+        train_pct = len(y_train) / total_samples * 100
+        val_pct = len(y_val) / total_samples * 100
+        test_pct = len(y_test) / total_samples * 100
+        
+        # Compute attack percentages
+        trn_atk_pct = y_train.mean() * 100
+        val_atk_pct = y_val.mean() * 100 if len(y_val) > 0 else 0.0
+        test_atk_pct = y_test.mean() * 100 if len(y_test) > 0 else 0.0
+        
+        print(f"  Stratified split -> "
+              f"train {len(y_train):,} ({train_pct:.1f}%, {trn_atk_pct:.1f}% attack), "
+              f"val {len(y_val):,} ({val_pct:.1f}%, {val_atk_pct:.1f}% attack), "
+              f"test {len(y_test):,} ({test_pct:.1f}%, {test_atk_pct:.1f}% attack)")
+        
+        # Warn if actual split differs from target by >5 percentage points
+        train_target_pct = train_ratio * 100
+        val_target_pct = val_ratio * 100
+        test_target_pct = test_ratio * 100
+        
+        if abs(train_pct - train_target_pct) > 5.0:
+            print(f"  ⚠️  Train split {train_pct:.1f}% differs from target {train_target_pct:.1f}% by {abs(train_pct - train_target_pct):.1f}pp")
+        if abs(val_pct - val_target_pct) > 5.0:
+            print(f"  ⚠️  Val split {val_pct:.1f}% differs from target {val_target_pct:.1f}% by {abs(val_pct - val_target_pct):.1f}pp")
+        if abs(test_pct - test_target_pct) > 5.0:
+            print(f"  ⚠️  Test split {test_pct:.1f}% differs from target {test_target_pct:.1f}% by {abs(test_pct - test_target_pct):.1f}pp")
 
     del X_np
     try:

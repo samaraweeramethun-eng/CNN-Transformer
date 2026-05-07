@@ -7,8 +7,9 @@ class CNNTransformerConfig:
     output_dir: str = "artifacts"
     csv_chunksize: int = 200_000
     max_rows: int = 0  # 0 = load all rows
-    val_size: float = 0.1
-    test_size: float = 0.2
+    train_ratio: float = 0.70  # fraction of data for training
+    val_ratio: float = 0.15  # fraction of data for validation
+    test_ratio: float = 0.15  # fraction of data for test (held-out)
     random_state: int = 42
     epochs: int = 25
     batch_size: int = 1024
