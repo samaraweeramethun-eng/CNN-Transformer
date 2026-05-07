@@ -13,14 +13,14 @@ class CNNTransformerConfig:
     epochs: int = 25
     batch_size: int = 1024
     val_batch_size: int = 2048
-    lr: float = 1.5e-3
+    lr: float = 1e-4
     weight_decay: float = 1e-4
-    label_smoothing: float = 0.05
-    conv_channels: int = 96
-    num_layers: int = 3
-    num_heads: int = 8
-    d_model: int = 192
-    d_ff: int = 768
+    label_smoothing: float = 0.0
+    conv_channels: int = 64
+    num_layers: int = 2
+    num_heads: int = 4
+    d_model: int = 128
+    d_ff: int = 512
     dropout: float = 0.2
     undersampling_ratio: float = 0.15
     ig_steps: int = 32
@@ -31,5 +31,5 @@ class CNNTransformerConfig:
     correlation_threshold: float = 0.95
     skew_threshold: float = 5.0
     near_dup_decimals: int = 3  # round features to N decimals before dedup (0 = disabled)
-    warmup_epochs: int = 3  # LR warmup epochs (critical for Transformer stability)
+    warmup_epochs: int = 5  # LR warmup epochs (critical for Transformer stability)
     patience: int = 7  # early stopping patience (epochs without ROC-AUC improvement)
