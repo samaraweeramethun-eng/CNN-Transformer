@@ -14,14 +14,14 @@ class CNNTransformerConfig:
     batch_size: int = 1024
     val_batch_size: int = 2048
     lr: float = 1e-4
-    weight_decay: float = 1e-4
-    label_smoothing: float = 0.0
+    weight_decay: float = 5e-3
+    label_smoothing: float = 0.1
     conv_channels: int = 64
     num_layers: int = 2
     num_heads: int = 4
     d_model: int = 128
     d_ff: int = 512
-    dropout: float = 0.2
+    dropout: float = 0.3
     undersampling_ratio: float = 0.15
     ig_steps: int = 32
     ig_samples: int = 512

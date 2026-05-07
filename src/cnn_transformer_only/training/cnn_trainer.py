@@ -202,16 +202,10 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
     if multi_gpu:
         model = DataParallel(model)
 
-    # Sqrt-dampened class weights (capped at 3) to avoid mode collapse
-    mild_weight = torch.tensor(
-        [1.0, min(float(class_weight_tensor[1].item()) ** 0.5, 3.0)],
-        dtype=torch.float32,
-    )
-    print(f"Mild class weights (sqrt-dampened, capped at 3): {mild_weight.tolist()}")
-    criterion = nn.CrossEntropyLoss(
-        weight=mild_weight.to(device),
-        label_smoothing=config.label_smoothing,
-    )
+    # No class weights for CNN-Transformer: the balanced training data already
+    # handles imbalance via IntelligentDataBalancer.  Adding weights on top
+    # causes the model to predict all-attack (mode collapse).
+    criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
     optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
     # Warmup + cosine annealing (critical for Transformer stability)
