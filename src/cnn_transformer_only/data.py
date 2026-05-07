@@ -486,11 +486,19 @@ def prepare_training_data(
             # to enable finer-grained stratified block assignment.
             # More blocks = better attack-rate balancing while keeping temporal grouping.
             n_orig = len(unique_groups)
-            n_blocks = max(30, min(50, len(y) // 3_000))
+            
+            # Read split strategy config
+            split_strategy = getattr(config, 'split_strategy', 'temporal_chunks')
+            num_blocks = getattr(config, 'num_blocks', 50)
+            chunk_size_blocks = getattr(config, 'chunk_size_blocks', 5)
+            purge_gap_blocks = getattr(config, 'purge_gap_blocks', 0)
+            
+            n_blocks = num_blocks
             source_groups = (np.arange(len(y)) * n_blocks // len(y)).astype(np.int32)
             unique_groups = np.unique(source_groups)
+            
             print(f"  Only {n_orig} CSV source(s); created {len(unique_groups)} "
-                  f"sequential blocks for stratified block assignment")
+                  f"sequential blocks for split_strategy='{split_strategy}'")
             
             # Compute per-block statistics
             block_stats = []
@@ -512,103 +520,283 @@ def prepare_training_data(
             if len(block_stats) > 10:
                 print(f"    ... ({len(block_stats) - 10} more blocks)")
             
-            # ── Stratified block assignment optimizer ──────────────────────
-            # Assign blocks to train/val/test to minimize attack rate differences
-            # while respecting target split sizes
-            print(f"\n  Optimizing block assignment for balanced attack rates...")
+            # ══════════════════════════════════════════════════════════════════
+            # SPLIT STRATEGY SELECTION
+            # ══════════════════════════════════════════════════════════════════
             
-            def _score_assignment(train_blocks, val_blocks, test_blocks, block_stats):
-                """Score a block assignment. Lower is better."""
-                train_size = sum(b["size"] for b in [block_stats[i] for i in train_blocks])
-                val_size = sum(b["size"] for b in [block_stats[i] for i in val_blocks])
-                test_size = sum(b["size"] for b in [block_stats[i] for i in test_blocks])
-                total_size = train_size + val_size + test_size
+            if split_strategy == "strict_time_ordered":
+                # ── Strategy 1: Strict Time-Ordered Split ─────────────────────
+                # Simply assign first 70% blocks to train, next 15% to val, last 15% to test
+                # No attack rate balancing, preserves strict temporal order
+                print(f"\n  Using strict_time_ordered split (no attack rate balancing)...")
                 
-                if total_size == 0:
-                    return float("inf")
+                n_total_blocks = len(block_stats)
+                train_end = int(n_total_blocks * train_ratio)
+                val_end = train_end + int(n_total_blocks * val_ratio)
                 
-                train_pct = train_size / total_size
-                val_pct = val_size / total_size
-                test_pct = test_size / total_size
+                train_block_ids = list(range(0, train_end))
+                val_block_ids = list(range(train_end, val_end))
+                test_block_ids = list(range(val_end, n_total_blocks))
                 
-                # Compute attack rates
-                train_attack = sum(b["size"] * b["attack_pct"] for b in [block_stats[i] for i in train_blocks])
-                train_attack_pct = train_attack / max(train_size, 1)
-                val_attack = sum(b["size"] * b["attack_pct"] for b in [block_stats[i] for i in val_blocks])
-                val_attack_pct = val_attack / max(val_size, 1)
-                test_attack = sum(b["size"] * b["attack_pct"] for b in [block_stats[i] for i in test_blocks])
-                test_attack_pct = test_attack / max(test_size, 1)
-                
-                # Penalty for split size deviation (weight=10)
-                size_penalty = 10 * (
-                    abs(train_pct - train_ratio) +
-                    abs(val_pct - val_ratio) +
-                    abs(test_pct - test_ratio)
-                )
-                
-                # Penalty for attack rate deviation (weight=1)
-                avg_attack_pct = (train_attack_pct + val_attack_pct + test_attack_pct) / 3
-                attack_penalty = (
-                    abs(train_attack_pct - avg_attack_pct) +
-                    abs(val_attack_pct - avg_attack_pct) +
-                    abs(test_attack_pct - avg_attack_pct)
-                )
-                
-                return size_penalty + attack_penalty
+                print(f"  Assigned blocks: train=[0-{train_end-1}], val=[{train_end}-{val_end-1}], test=[{val_end}-{n_total_blocks-1}]")
             
-            # Sort blocks by attack percentage for stratified sampling
-            sorted_blocks = sorted(range(len(block_stats)), key=lambda i: block_stats[i]["attack_pct"])
-            
-            # Try greedy assignment: distribute blocks in round-robin fashion
-            # Start with blocks sorted by attack rate to ensure even distribution
-            best_score = float("inf")
-            best_assignment = None
-            
-            # Try multiple random seeds for robustness
-            rng = np.random.RandomState(config.random_state)
-            for seed_offset in range(10):
-                # Shuffle sorted blocks slightly to explore variations
-                shuffled = sorted_blocks.copy()
-                if seed_offset > 0:
-                    # Shuffle within windows of 3 blocks to maintain rough stratification
-                    for i in range(0, len(shuffled) - 2, 3):
-                        window = shuffled[i:i+3]
-                        rng.shuffle(window)
-                        shuffled[i:i+3] = window
+            elif split_strategy == "temporal_chunks":
+                # ── Strategy 2: Temporal Chunk Assignment ─────────────────────
+                # Group adjacent blocks into chunks, assign whole chunks to splits
+                print(f"\n  Using temporal_chunks split (chunk_size={chunk_size_blocks} blocks)...")
                 
-                # Assign blocks in round-robin: train gets 70%, val gets 15%, test gets 15%
-                # Pattern: T T T T T T T V T T Test T T T ...
-                train_blocks = []
-                val_blocks = []
-                test_blocks = []
+                # Group blocks into chunks
+                n_total_blocks = len(block_stats)
+                n_chunks = (n_total_blocks + chunk_size_blocks - 1) // chunk_size_blocks
                 
-                for i, block_idx in enumerate(shuffled):
-                    # Every ~6.7 blocks → train, every ~46.7 blocks → val, every ~46.7 → test
-                    # Use cumulative logic to hit target ratios
-                    current_train = len(train_blocks)
-                    current_val = len(val_blocks)
-                    current_test = len(test_blocks)
-                    total_assigned = current_train + current_val + current_test + 1
+                chunk_stats = []
+                for chunk_id in range(n_chunks):
+                    start_block = chunk_id * chunk_size_blocks
+                    end_block = min((chunk_id + 1) * chunk_size_blocks, n_total_blocks)
+                    chunk_blocks = list(range(start_block, end_block))
                     
-                    target_train = int(total_assigned * train_ratio + 0.5)
-                    target_val = int(total_assigned * val_ratio + 0.5)
+                    # Compute aggregate stats for this chunk
+                    chunk_size = sum(block_stats[b]['size'] for b in chunk_blocks)
+                    chunk_attack_sum = sum(block_stats[b]['size'] * block_stats[b]['attack_pct'] 
+                                          for b in chunk_blocks)
+                    chunk_attack_pct = chunk_attack_sum / max(chunk_size, 1)
                     
-                    if current_train < target_train:
-                        train_blocks.append(block_idx)
-                    elif current_val < target_val:
-                        val_blocks.append(block_idx)
-                    else:
-                        test_blocks.append(block_idx)
+                    chunk_stats.append({
+                        "chunk_id": chunk_id,
+                        "block_ids": chunk_blocks,
+                        "size": chunk_size,
+                        "attack_pct": chunk_attack_pct,
+                    })
                 
-                score = _score_assignment(train_blocks, val_blocks, test_blocks, block_stats)
-                if score < best_score:
-                    best_score = score
-                    best_assignment = (train_blocks, val_blocks, test_blocks)
+                print(f"  Created {len(chunk_stats)} temporal chunks from {n_total_blocks} blocks")
+                
+                # Apply purge gap if configured
+                if purge_gap_blocks > 0:
+                    print(f"  Purge gap enabled: excluding {purge_gap_blocks} boundary block(s) per chunk")
+                    for chunk in chunk_stats:
+                        # Remove first/last purge_gap_blocks from each chunk
+                        if len(chunk['block_ids']) > 2 * purge_gap_blocks:
+                            original_blocks = chunk['block_ids']
+                            chunk['block_ids'] = original_blocks[purge_gap_blocks:-purge_gap_blocks]
+                            # Recompute size with purged blocks
+                            chunk['size'] = sum(block_stats[b]['size'] for b in chunk['block_ids'])
+                            if chunk['size'] > 0:
+                                chunk_attack_sum = sum(block_stats[b]['size'] * block_stats[b]['attack_pct'] 
+                                                      for b in chunk['block_ids'])
+                                chunk['attack_pct'] = chunk_attack_sum / chunk['size']
+                
+                # Sort chunks by attack rate for stratified assignment
+                sorted_chunks = sorted(range(len(chunk_stats)), 
+                                      key=lambda i: chunk_stats[i]["attack_pct"])
+                
+                def _score_chunk_assignment(train_chunks, val_chunks, test_chunks, chunk_stats):
+                    """Score a chunk assignment. Lower is better."""
+                    train_size = sum(chunk_stats[i]['size'] for i in train_chunks)
+                    val_size = sum(chunk_stats[i]['size'] for i in val_chunks)
+                    test_size = sum(chunk_stats[i]['size'] for i in test_chunks)
+                    total_size = train_size + val_size + test_size
+                    
+                    if total_size == 0:
+                        return float("inf")
+                    
+                    train_pct = train_size / total_size
+                    val_pct = val_size / total_size
+                    test_pct = test_size / total_size
+                    
+                    # Compute attack rates
+                    train_attack = sum(chunk_stats[i]['size'] * chunk_stats[i]['attack_pct'] 
+                                      for i in train_chunks)
+                    train_attack_pct = train_attack / max(train_size, 1)
+                    val_attack = sum(chunk_stats[i]['size'] * chunk_stats[i]['attack_pct'] 
+                                    for i in val_chunks)
+                    val_attack_pct = val_attack / max(val_size, 1)
+                    test_attack = sum(chunk_stats[i]['size'] * chunk_stats[i]['attack_pct'] 
+                                     for i in test_chunks)
+                    test_attack_pct = test_attack / max(test_size, 1)
+                    
+                    # Penalty for split size deviation (weight=10)
+                    size_penalty = 10 * (
+                        abs(train_pct - train_ratio) +
+                        abs(val_pct - val_ratio) +
+                        abs(test_pct - test_ratio)
+                    )
+                    
+                    # Penalty for attack rate deviation (weight=1)
+                    avg_attack_pct = (train_attack_pct + val_attack_pct + test_attack_pct) / 3
+                    attack_penalty = (
+                        abs(train_attack_pct - avg_attack_pct) +
+                        abs(val_attack_pct - avg_attack_pct) +
+                        abs(test_attack_pct - avg_attack_pct)
+                    )
+                    
+                    return size_penalty + attack_penalty
+                
+                # Try multiple assignments to find best
+                best_score = float("inf")
+                best_assignment = None
+                
+                rng = np.random.RandomState(config.random_state)
+                for seed_offset in range(10):
+                    # Shuffle sorted chunks slightly to explore variations
+                    shuffled = sorted_chunks.copy()
+                    if seed_offset > 0:
+                        # Shuffle within windows to maintain rough stratification
+                        window_size = min(3, len(shuffled))
+                        for i in range(0, len(shuffled) - window_size + 1, window_size):
+                            window = shuffled[i:i+window_size]
+                            rng.shuffle(window)
+                            shuffled[i:i+window_size] = window
+                    
+                    # Assign chunks in round-robin
+                    train_chunks = []
+                    val_chunks = []
+                    test_chunks = []
+                    
+                    for i, chunk_idx in enumerate(shuffled):
+                        current_train = len(train_chunks)
+                        current_val = len(val_chunks)
+                        current_test = len(test_chunks)
+                        total_assigned = current_train + current_val + current_test + 1
+                        
+                        target_train = int(total_assigned * train_ratio + 0.5)
+                        target_val = int(total_assigned * val_ratio + 0.5)
+                        
+                        if current_train < target_train:
+                            train_chunks.append(chunk_idx)
+                        elif current_val < target_val:
+                            val_chunks.append(chunk_idx)
+                        else:
+                            test_chunks.append(chunk_idx)
+                    
+                    score = _score_chunk_assignment(train_chunks, val_chunks, test_chunks, chunk_stats)
+                    if score < best_score:
+                        best_score = score
+                        best_assignment = (train_chunks, val_chunks, test_chunks)
+                
+                if best_assignment is None:
+                    raise ValueError("Chunk assignment optimization failed")
+                
+                train_chunk_ids, val_chunk_ids, test_chunk_ids = best_assignment
+                
+                # Convert chunk assignments back to block IDs
+                train_block_ids = []
+                for chunk_id in train_chunk_ids:
+                    train_block_ids.extend(chunk_stats[chunk_id]['block_ids'])
+                
+                val_block_ids = []
+                for chunk_id in val_chunk_ids:
+                    val_block_ids.extend(chunk_stats[chunk_id]['block_ids'])
+                
+                test_block_ids = []
+                for chunk_id in test_chunk_ids:
+                    test_block_ids.extend(chunk_stats[chunk_id]['block_ids'])
+                
+                print(f"  Optimized chunk assignment: {len(train_chunk_ids)} train chunks, "
+                      f"{len(val_chunk_ids)} val chunks, {len(test_chunk_ids)} test chunks")
+                print(f"  This yields {len(train_block_ids)} train blocks, {len(val_block_ids)} val blocks, "
+                      f"{len(test_block_ids)} test blocks")
             
-            if best_assignment is None:
-                raise ValueError("Block assignment optimization failed")
+            else:  # Default: "stratified_blocks"
+                # ── Strategy 3: Stratified Block Assignment ───────────────────
+                # Current method: assigns individual blocks with attack rate balancing
+                print(f"\n  Using stratified_blocks split (attack rate balancing)...")
+                
+                def _score_assignment(train_blocks, val_blocks, test_blocks, block_stats):
+                    """Score a block assignment. Lower is better."""
+                    train_size = sum(b["size"] for b in [block_stats[i] for i in train_blocks])
+                    val_size = sum(b["size"] for b in [block_stats[i] for i in val_blocks])
+                    test_size = sum(b["size"] for b in [block_stats[i] for i in test_blocks])
+                    total_size = train_size + val_size + test_size
+                    
+                    if total_size == 0:
+                        return float("inf")
+                    
+                    train_pct = train_size / total_size
+                    val_pct = val_size / total_size
+                    test_pct = test_size / total_size
+                    
+                    # Compute attack rates
+                    train_attack = sum(b["size"] * b["attack_pct"] for b in [block_stats[i] for i in train_blocks])
+                    train_attack_pct = train_attack / max(train_size, 1)
+                    val_attack = sum(b["size"] * b["attack_pct"] for b in [block_stats[i] for i in val_blocks])
+                    val_attack_pct = val_attack / max(val_size, 1)
+                    test_attack = sum(b["size"] * b["attack_pct"] for b in [block_stats[i] for i in test_blocks])
+                    test_attack_pct = test_attack / max(test_size, 1)
+                    
+                    # Penalty for split size deviation (weight=10)
+                    size_penalty = 10 * (
+                        abs(train_pct - train_ratio) +
+                        abs(val_pct - val_ratio) +
+                        abs(test_pct - test_ratio)
+                    )
+                    
+                    # Penalty for attack rate deviation (weight=1)
+                    avg_attack_pct = (train_attack_pct + val_attack_pct + test_attack_pct) / 3
+                    attack_penalty = (
+                        abs(train_attack_pct - avg_attack_pct) +
+                        abs(val_attack_pct - avg_attack_pct) +
+                        abs(test_attack_pct - avg_attack_pct)
+                    )
+                    
+                    return size_penalty + attack_penalty
+                
+                # Sort blocks by attack percentage for stratified sampling
+                sorted_blocks = sorted(range(len(block_stats)), key=lambda i: block_stats[i]["attack_pct"])
+                
+                # Try greedy assignment: distribute blocks in round-robin fashion
+                # Start with blocks sorted by attack rate to ensure even distribution
+                best_score = float("inf")
+                best_assignment = None
+                
+                # Try multiple random seeds for robustness
+                rng = np.random.RandomState(config.random_state)
+                for seed_offset in range(10):
+                    # Shuffle sorted blocks slightly to explore variations
+                    shuffled = sorted_blocks.copy()
+                    if seed_offset > 0:
+                        # Shuffle within windows of 3 blocks to maintain rough stratification
+                        for i in range(0, len(shuffled) - 2, 3):
+                            window = shuffled[i:i+3]
+                            rng.shuffle(window)
+                            shuffled[i:i+3] = window
+                    
+                    # Assign blocks in round-robin: train gets 70%, val gets 15%, test gets 15%
+                    train_blocks = []
+                    val_blocks = []
+                    test_blocks = []
+                    
+                    for i, block_idx in enumerate(shuffled):
+                        # Use cumulative logic to hit target ratios
+                        current_train = len(train_blocks)
+                        current_val = len(val_blocks)
+                        current_test = len(test_blocks)
+                        total_assigned = current_train + current_val + current_test + 1
+                        
+                        target_train = int(total_assigned * train_ratio + 0.5)
+                        target_val = int(total_assigned * val_ratio + 0.5)
+                        
+                        if current_train < target_train:
+                            train_blocks.append(block_idx)
+                        elif current_val < target_val:
+                            val_blocks.append(block_idx)
+                        else:
+                            test_blocks.append(block_idx)
+                    
+                    score = _score_assignment(train_blocks, val_blocks, test_blocks, block_stats)
+                    if score < best_score:
+                        best_score = score
+                        best_assignment = (train_blocks, val_blocks, test_blocks)
+                
+                if best_assignment is None:
+                    raise ValueError("Block assignment optimization failed")
+                
+                train_block_ids, val_block_ids, test_block_ids = best_assignment
+                print(f"  Optimized assignment: {len(train_block_ids)} train blocks, "
+                      f"{len(val_block_ids)} val blocks, {len(test_block_ids)} test blocks")
             
-            train_block_ids, val_block_ids, test_block_ids = best_assignment
+            # ══════════════════════════════════════════════════════════════════
+            # CONVERT BLOCK ASSIGNMENTS TO ROW INDICES
+            # ══════════════════════════════════════════════════════════════════
             
             # Convert block IDs to row indices
             trn_idx = np.where(np.isin(source_groups, train_block_ids))[0]
@@ -838,20 +1026,63 @@ def prepare_training_data(
                 nn_pass = False
             elif pct_very_close > 5.0:
                 print(f"      ⚠️  {pct_very_close:.1f}% of {split_name} samples very close to training (borderline)")
+                # Don't fail on borderline, but note it
             else:
                 print(f"      ✓ Distance distribution looks reasonable")
         
+        # Check attack rate balance
+        attack_rate_balanced = True
+        max_attack_diff = 0.0
+        if len(y_val) > 0:
+            max_attack_diff = max(max_attack_diff, abs(val_atk_pct - trn_atk_pct))
+        if len(y_test) > 0:
+            max_attack_diff = max(max_attack_diff, abs(test_atk_pct - trn_atk_pct))
+        
+        if max_attack_diff > 10.0:
+            attack_rate_balanced = False
+        
         # Summary
-        print(f"\n  Leakage check summary:")
+        print(f"\n  {'='*70}")
+        print(f"  LEAKAGE & SPLIT QUALITY SUMMARY")
+        print(f"  {'='*70}")
         print(f"    Exact duplicates:       {'✓ PASS' if exact_dup_pass else '✗ FAIL'}")
         print(f"    Near-duplicates:        {'✓ PASS' if near_dup_pass else '✗ FAIL'}")
         print(f"    Nearest-neighbor:       {'✓ PASS' if nn_pass else '✗ FAIL'}")
+        print(f"    Attack rate balance:    {'✓ PASS' if attack_rate_balanced else '⚠ WARN'} "
+              f"(max diff: {max_attack_diff:.1f}pp)")
         
         leakage_pass = exact_dup_pass and near_dup_pass and nn_pass
-        if leakage_pass:
+        if leakage_pass and attack_rate_balanced:
+            print(f"  {'='*70}")
             print(f"    Overall:                ✓ ALL CHECKS PASSED")
+            print(f"  {'='*70}")
+        elif leakage_pass:
+            print(f"  {'='*70}")
+            print(f"    Overall:                ⚠ LEAKAGE PASS, but attack rate unbalanced")
+            print(f"  {'='*70}")
         else:
-            print(f"    Overall:                ✗ SOME CHECKS FAILED (review warnings above)")
+            print(f"  {'='*70}")
+            print(f"    Overall:                ✗ LEAKAGE CHECKS FAILED")
+            print(f"  {'='*70}")
+            
+            # Provide recommendations based on failures
+            if not nn_pass:
+                split_strategy = getattr(config, 'split_strategy', 'temporal_chunks')
+                print(f"\n  ⚠️  TEMPORAL-NEIGHBOR LEAKAGE DETECTED")
+                print(f"  The split may contain adjacent blocks with very similar traffic patterns.")
+                print(f"\n  Recommendations:")
+                if split_strategy == "stratified_blocks":
+                    print(f"    1. Switch to split_strategy='temporal_chunks' (config.split_strategy)")
+                    print(f"    2. Increase chunk_size_blocks (e.g., 10 instead of 5)")
+                elif split_strategy == "temporal_chunks":
+                    chunk_size = getattr(config, 'chunk_size_blocks', 5)
+                    print(f"    1. Increase chunk_size_blocks from {chunk_size} to {chunk_size * 2}")
+                    print(f"    2. Enable purge_gap_blocks=1 to exclude boundary blocks")
+                    print(f"    3. Try split_strategy='strict_time_ordered' for strict temporal separation")
+                else:
+                    print(f"    1. Current strategy: '{split_strategy}'")
+                    print(f"    2. If leakage persists, the dataset may have inherent temporal similarity")
+                print(f"  {'='*70}\n")
 
     if not split_done:
         test_block_map = None  # No block assignments for non-grouped split

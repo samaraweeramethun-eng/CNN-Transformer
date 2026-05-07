@@ -37,3 +37,8 @@ class CNNTransformerConfig:
     checkpoint_metric: str = "best_f1"  # primary metric for checkpoint/early stop: "best_f1", "roc_auc", "pr_auc", "val_loss"
     attack_class_weight: float = 0.0  # 0 = disabled (use balanced data only); >0 overrides
     grad_clip: float = 0.5  # max gradient norm for clipping
+    # Split strategy options
+    split_strategy: str = "temporal_chunks"  # "stratified_blocks", "temporal_chunks", "strict_time_ordered"
+    num_blocks: int = 50  # number of sequential blocks to create
+    chunk_size_blocks: int = 5  # number of adjacent blocks per temporal chunk (for temporal_chunks strategy)
+    purge_gap_blocks: int = 0  # exclude N blocks at chunk boundaries to reduce temporal leakage (0 = disabled)
