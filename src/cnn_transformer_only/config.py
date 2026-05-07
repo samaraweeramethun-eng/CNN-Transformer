@@ -31,3 +31,5 @@ class CNNTransformerConfig:
     correlation_threshold: float = 0.95
     skew_threshold: float = 5.0
     near_dup_decimals: int = 3  # round features to N decimals before dedup (0 = disabled)
+    warmup_epochs: int = 3  # LR warmup epochs (critical for Transformer stability)
+    patience: int = 7  # early stopping patience (epochs without ROC-AUC improvement)

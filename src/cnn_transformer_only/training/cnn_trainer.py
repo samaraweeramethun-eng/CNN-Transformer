@@ -1,8 +1,10 @@
 import gc
+import math
 import os
 import random
 
 import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -144,6 +146,15 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
     balancer = IntelligentDataBalancer(config.undersampling_ratio, config.random_state)
     X_train_bal, y_train_bal = balancer.balance_classes(X_train, y_train)
 
+    # Compute class weights for cost-sensitive loss (before deleting labels)
+    n_benign_train = int((y_train_bal == 0).sum())
+    n_attack_train = int((y_train_bal == 1).sum())
+    class_weight_tensor = torch.tensor(
+        [1.0, n_benign_train / max(n_attack_train, 1)],
+        dtype=torch.float32,
+    )
+    print(f"Class weights: benign=1.00, attack={class_weight_tensor[1]:.2f}")
+
     input_dim = X_train.shape[1]
     del X_train, y_train
     gc.collect()
@@ -191,32 +202,50 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
     if multi_gpu:
         model = DataParallel(model)
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
-    optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    scheduler = (
-        optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=config.lr,
-            epochs=config.epochs,
-            steps_per_epoch=max(len(train_loader), 1),
-        )
-        if len(train_loader) > 0
-        else None
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weight_tensor.to(device),
+        label_smoothing=config.label_smoothing,
     )
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+
+    # Warmup + cosine annealing (critical for Transformer stability)
+    warmup_epochs = getattr(config, "warmup_epochs", 3)
+    steps_per_epoch = max(len(train_loader), 1)
+    warmup_steps = warmup_epochs * steps_per_epoch
+    total_steps = config.epochs * steps_per_epoch
+
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda) if total_steps > 0 else None
 
     best_auc = 0.0
     best_state = None
+    patience = getattr(config, "patience", 7)
+    no_improve = 0
+    epoch_history: list[dict] = []
 
     for epoch in range(1, config.epochs + 1):
         train_loss = _train_epoch(model, train_loader, criterion, optimizer, scheduler, device)
         val_loss, metrics, _, _ = _eval_epoch(model, val_loader, criterion, device)
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch:02d} | Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} | "
-            f"ROC-AUC {metrics['auc_roc']:.4f} | F1 {metrics['f1_score']:.4f}"
+            f"ROC-AUC {metrics['auc_roc']:.4f} | F1 {metrics['f1_score']:.4f} | "
+            f"LR {current_lr:.2e}"
         )
+        epoch_history.append({
+            "epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
+            "roc_auc": metrics["auc_roc"], "f1": metrics["f1_score"],
+            "precision": metrics["precision"], "recall": metrics["recall"],
+        })
 
         if metrics["auc_roc"] > best_auc:
             best_auc = metrics["auc_roc"]
+            no_improve = 0
             state_dict = model.module.state_dict() if isinstance(model, DataParallel) else model.state_dict()
             preprocess_state = {
                 "type": "standard_scaler",
@@ -236,6 +265,42 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
                 "preprocessor": preprocess_state,
                 "model_type": "cnn_transformer",
             }
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"Early stopping at epoch {epoch} (patience={patience})")
+                break
+
+    # ── Plot training curves (loss, ROC-AUC, F1) ─────────────────────
+    if epoch_history:
+        if best_state is not None:
+            best_state["epoch_history"] = epoch_history
+        epochs_arr = [h["epoch"] for h in epoch_history]
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        axes[0].plot(epochs_arr, [h["train_loss"] for h in epoch_history], label="Train Loss")
+        axes[0].plot(epochs_arr, [h["val_loss"] for h in epoch_history], label="Val Loss")
+        axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
+        axes[0].set_title("CNN-Transformer — Loss"); axes[0].legend(); axes[0].grid(True)
+
+        axes[1].plot(epochs_arr, [h["roc_auc"] for h in epoch_history], label="Val ROC-AUC", color="tab:orange")
+        axes[1].axhline(y=best_auc, color="r", linestyle="--", alpha=0.5, label=f"Best={best_auc:.4f}")
+        axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("ROC-AUC")
+        axes[1].set_title("CNN-Transformer — ROC-AUC"); axes[1].legend(); axes[1].grid(True)
+        axes[1].set_ylim(0, 1.05)
+
+        axes[2].plot(epochs_arr, [h["f1"] for h in epoch_history], label="Val F1", color="tab:green")
+        axes[2].plot(epochs_arr, [h["precision"] for h in epoch_history], label="Val Precision", color="tab:blue", linestyle="--")
+        axes[2].plot(epochs_arr, [h["recall"] for h in epoch_history], label="Val Recall", color="tab:red", linestyle="--")
+        axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("Score")
+        axes[2].set_title("CNN-Transformer — F1 / Precision / Recall"); axes[2].legend(); axes[2].grid(True)
+        axes[2].set_ylim(0, 1.05)
+
+        plt.tight_layout()
+        curve_path = os.path.join(config.output_dir, "cnn_transformer_training_curves.png")
+        plt.savefig(curve_path, dpi=160, bbox_inches="tight")
+        plt.show()
+        print(f"Saved training curves -> {curve_path}")
 
     if best_state is None:
         print("Training failed to improve beyond initialization.")
