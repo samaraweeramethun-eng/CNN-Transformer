@@ -792,6 +792,10 @@ def prepare_training_data(
         train_idx_nn = rng_nn.choice(len(X_train_raw), n_train_sample, replace=False)
         X_train_sample = X_train_raw[train_idx_nn]
         
+        # Handle NaN values (replace with -999 for this diagnostic only)
+        # NearestNeighbors doesn't accept NaN, and we need quick imputation
+        X_train_sample = np.nan_to_num(X_train_sample, nan=-999.0)
+        
         # Standardize samples (just for distance computation)
         from sklearn.preprocessing import StandardScaler
         scaler_nn = StandardScaler()
@@ -805,6 +809,9 @@ def prepare_training_data(
             n_sample = n_val_sample if split_name == "val" else n_test_sample
             split_idx = rng_nn.choice(len(X_split), n_sample, replace=False)
             X_split_sample = X_split[split_idx]
+            
+            # Handle NaN values (same as training sample)
+            X_split_sample = np.nan_to_num(X_split_sample, nan=-999.0)
             X_split_sample_scaled = scaler_nn.transform(X_split_sample)
             
             nn = NearestNeighbors(n_neighbors=1, metric='euclidean', n_jobs=-1)
