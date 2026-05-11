@@ -355,14 +355,90 @@ def prepare_training_data(
     config,
     source_groups: np.ndarray | None = None,
 ):
-    """Enhanced preprocessing: dedup → clean → split → impute → transform → scale.
+    """Enhanced preprocessing pipeline: dedup → clean → split → impute → transform → scale.
 
     All transforms are fit on training data only to prevent data leakage.
 
+    Pipeline Steps
+    --------------
+    1. **Inf replacement**: Replace inf/-inf with NaN for downstream imputation.
+    2. **Exact dedup**: Remove byte-identical rows via numpy void views.
+    3. **Near-duplicate removal**: Round features to ``config.near_dup_decimals``
+       decimals, then deduplicate.  NaN values are mapped to -999.0 for hashing.
+    4. **Zero-variance / duplicate column removal**: Drops constant columns and
+       columns that are byte-identical to an earlier column.
+    5. **Train/val/test split**: Uses one of three strategies (see below).
+    6. **Missing indicators + median imputation**: Creates binary ``_missing``
+       columns for features with NaN, then fills NaN with training-set medians.
+    7. **Correlation filtering**: Drops features with |r| > ``config.correlation_threshold``
+       (fit on train).
+    8. **Log1p transform**: Applies ``log1p`` to non-negative features with
+       absolute skewness > ``config.skew_threshold`` (fit on train).
+    9. **Standard scaling**: ``StandardScaler`` fit on training split only.
+
+    Splitting Strategies
+    --------------------
+    Controlled by ``config.split_strategy`` (default ``"temporal_chunks"``):
+
+    **temporal_chunks** (recommended):
+        Groups ``config.num_blocks`` sequential blocks into larger temporal
+        chunks of ``config.chunk_size_blocks`` adjacent blocks each.  Whole
+        chunks are assigned to train / val / test using a stratified round-robin
+        optimizer that balances both split size (70/15/15) and attack-rate
+        parity.  Optional ``config.purge_gap_blocks`` removes boundary blocks
+        from each chunk to reduce temporal-neighbour leakage.
+
+    **stratified_blocks**:
+        Assigns individual sequential blocks to splits.  Blocks are sorted by
+        attack percentage and distributed via round-robin to equalise attack
+        rates.  Finer-grained than temporal_chunks but more susceptible to
+        temporal-neighbour leakage between adjacent blocks in different splits.
+
+    **strict_time_ordered**:
+        First 70% of blocks → train, next 15% → val, last 15% → test.  No
+        attack-rate balancing; preserves strict temporal ordering.  Suitable
+        when concept-drift evaluation is the priority.
+
+    When multiple CSV source files are provided (≥ 3 unique groups),
+    ``GroupShuffleSplit`` is used instead, treating each source file as a group.
+
+    Leakage Verification
+    --------------------
+    After splitting, three automated checks run:
+
+    1. **Exact duplicate check**: Ensures no identical rows exist across splits.
+    2. **Near-duplicate check**: Rounds rows to ``config.near_dup_decimals`` and
+       checks for hash collisions across splits.
+    3. **Nearest-neighbour distance check**: Fits k-NN (k=1) on a training
+       sample, queries val/test samples, and flags if >10% of samples have
+       Euclidean distance < 0.01 (after standardisation).
+
+    A pass/fail summary is printed with recommendations when checks fail.
+
+    Parameters
+    ----------
+    X_np : np.ndarray
+        Feature matrix, shape ``(n_samples, n_features)``, dtype float32.
+    y : np.ndarray
+        Binary labels, 0 = benign, 1 = attack.
+    feature_cols : list[str]
+        Feature column names matching ``X_np`` columns.
+    config : CNNTransformerConfig
+        Configuration dataclass with split ratios, strategy, and thresholds.
+    source_groups : np.ndarray or None
+        Per-row group IDs (e.g. source CSV index).  When provided and
+        ``config.grouped_split`` is True, used for group-aware splitting.
+
     Returns
     -------
-    tuple of (X_train, X_val, X_test, y_train, y_val, y_test,
-              scaler, train_medians, feature_cols, preprocess_meta)
+    tuple of 11 elements:
+        ``(X_train, X_val, X_test, y_train, y_val, y_test,
+        scaler, train_medians, feature_cols, preprocess_meta, test_block_map)``
+
+        - ``test_block_map``: int array mapping each test row to its block ID
+          (or None when GroupShuffleSplit / non-grouped split is used).
+        - ``preprocess_meta``: dict with ``csv_feature_cols``,
+          ``log1p_columns``, and ``indicator_source_columns``.
     """
     import gc
 
