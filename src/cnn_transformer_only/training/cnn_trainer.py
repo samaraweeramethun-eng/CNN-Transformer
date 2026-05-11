@@ -667,9 +667,9 @@ def train_cnn_transformer(config: CNNTransformerConfig | None = None):
                 
                 # Compute metrics for this block
                 block_metrics = calculate_comprehensive_metrics(
-                    block_targets.cpu().numpy(),
-                    block_preds.cpu().numpy(),
-                    block_probs.cpu().numpy()
+                    block_targets,
+                    block_preds,
+                    block_probs
                 )
                 
                 # Confusion matrix
