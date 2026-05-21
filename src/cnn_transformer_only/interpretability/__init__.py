@@ -1,1 +1,1 @@
-__all__ = ["integrated_gradients", "grad_cam", "shap_runner"]
+__all__ = ["integrated_gradients", "grad_cam", "shap_runner", "lime_runner"]
