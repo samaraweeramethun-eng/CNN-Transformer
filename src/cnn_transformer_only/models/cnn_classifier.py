@@ -24,7 +24,7 @@ class CNNClassifier(nn.Module):
             nn.Conv1d(conv_channels, conv_channels, kernel_size=3, padding=1),
             nn.BatchNorm1d(conv_channels),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
         )
         self.classifier = nn.Sequential(
             nn.LayerNorm(conv_channels),

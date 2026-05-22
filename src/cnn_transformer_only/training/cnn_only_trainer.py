@@ -39,22 +39,53 @@ def _set_seeds(seed: int):
 # _prepare_scaled_data removed — replaced by prepare_training_data in data.py
 
 
-def _train_epoch(model, loader, criterion, optimizer, scheduler, device):
+def _check_nan_inf(tensor) -> bool:
+    """Return True if tensor contains NaN or Inf."""
+    if tensor is None:
+        return False
+    return bool(torch.isnan(tensor).any() or torch.isinf(tensor).any())
+
+
+def _compute_grad_norm(model) -> float:
+    """Compute total gradient L2 norm across all parameters."""
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total_norm += p.grad.data.norm(2).item() ** 2
+    return total_norm ** 0.5
+
+
+def _train_epoch(model, loader, criterion, optimizer, scheduler, device, grad_clip: float = 0.5):
+    """Train one epoch; returns (avg_loss, nan_detected)."""
     model.train()
     running_loss = 0.0
+    nan_detected = False
+
     for data, target in loader:
         data = data.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         logits = model(data)
         loss = criterion(logits, target)
+
+        if _check_nan_inf(loss):
+            nan_detected = True
+            break
+
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        norm_pre = _compute_grad_norm(model)
+        if not np.isfinite(norm_pre):
+            nan_detected = True
+            break
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
         running_loss += loss.item()
-    return running_loss / max(len(loader), 1)
+
+    return running_loss / max(len(loader), 1), nan_detected
 
 
 def _eval_epoch(model, loader, criterion, device):
@@ -128,6 +159,7 @@ def train_cnn_classifier(config: CNNTransformerConfig | None = None):
         config.val_batch_size = 1024
 
     os.makedirs(config.output_dir, exist_ok=True)
+    grad_clip = getattr(config, "grad_clip", 0.5)
 
     print("Loading dataset for CNN classifier training...")
     X, y, feature_cols, _, source_groups = load_cicids_feature_matrix(
@@ -216,56 +248,130 @@ def train_cnn_classifier(config: CNNTransformerConfig | None = None):
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda) if total_steps > 0 else None
 
-    best_auc = 0.0
-    best_state = None
+    checkpoint_metric = getattr(config, "checkpoint_metric", "best_f1")
     patience = getattr(config, "patience", 7)
+
+    best_roc_auc = {"value": 0.0, "epoch": 0, "state": None, "threshold": 0.5}
+    best_f1 = {"value": 0.0, "epoch": 0, "state": None, "threshold": 0.5}
+    best_val_loss = {"value": float("inf"), "epoch": 0, "state": None, "threshold": 0.5}
+
     no_improve = 0
     epoch_history: list[dict] = []
+    nan_abort = False
 
     for epoch in range(1, config.epochs + 1):
-        train_loss = _train_epoch(model, train_loader, criterion, optimizer, scheduler, device)
-        val_loss, metrics, _, _ = _eval_epoch(model, val_loader, criterion, device)
+        train_loss, nan_detected = _train_epoch(
+            model, train_loader, criterion, optimizer, scheduler, device, grad_clip=grad_clip
+        )
+
+        if nan_detected:
+            print(f"\n⚠️  NaN/Inf detected at epoch {epoch}! Stopping training safely.")
+            nan_abort = True
+            break
+
+        val_loss, _, val_probs, val_targets = _eval_epoch(model, val_loader, criterion, device)
+
+        # Fine threshold search on validation
+        val_best_thr, val_best_f1 = find_best_f1_threshold(val_targets, val_probs)
+        val_preds_tuned = binary_predictions_from_proba(val_probs, val_best_thr)
+        val_metrics_tuned = calculate_comprehensive_metrics(val_targets, val_preds_tuned, val_probs)
+
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch:02d} | Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} | "
-            f"ROC-AUC {metrics['auc_roc']:.4f} | F1 {metrics['f1_score']:.4f} | "
+            f"ROC-AUC {val_metrics_tuned['auc_roc']:.4f} | F1 {val_best_f1:.4f}@{val_best_thr:.3f} | "
             f"LR {current_lr:.2e}"
         )
         epoch_history.append({
             "epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
-            "roc_auc": metrics["auc_roc"], "f1": metrics["f1_score"],
-            "precision": metrics["precision"], "recall": metrics["recall"],
+            "roc_auc": val_metrics_tuned["auc_roc"], "f1": val_best_f1,
+            "precision": val_metrics_tuned["precision"], "recall": val_metrics_tuned["recall"],
+            "best_threshold": val_best_thr,
         })
 
-        if metrics["auc_roc"] > best_auc:
-            best_auc = metrics["auc_roc"]
-            no_improve = 0
-            state_dict = model.module.state_dict() if isinstance(model, DataParallel) else model.state_dict()
-            preprocess_state = {
-                "type": "standard_scaler",
-                "medians": medians.to_dict(),
-                "mean": scaler.mean_.tolist(),
-                "scale": scaler.scale_.tolist(),
-                "log1p_columns": prep_meta["log1p_columns"],
-                "indicator_source_columns": prep_meta["indicator_source_columns"],
-                "csv_columns": prep_meta["csv_feature_cols"],
-            }
-            best_state = {
-                "model_state_dict": state_dict,
+        # ── Multi-checkpoint saving ────────────────────────────────────────
+        state_dict = model.module.state_dict() if isinstance(model, DataParallel) else model.state_dict()
+        preprocess_state = {
+            "type": "standard_scaler",
+            "medians": medians.to_dict(),
+            "mean": scaler.mean_.tolist(),
+            "scale": scaler.scale_.tolist(),
+            "log1p_columns": prep_meta["log1p_columns"],
+            "indicator_source_columns": prep_meta["indicator_source_columns"],
+            "csv_columns": prep_meta["csv_feature_cols"],
+        }
+
+        def _make_checkpoint():
+            return {
+                "model_state_dict": state_dict.copy(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "metrics": metrics,
+                "metrics": val_metrics_tuned,
                 "config": config.__dict__,
                 "feature_columns": feature_cols,
                 "preprocessor": preprocess_state,
                 "model_type": "cnn_classifier",
+                "epoch": epoch,
+                "threshold": val_best_thr,
             }
+
+        if val_metrics_tuned["auc_roc"] > best_roc_auc["value"]:
+            best_roc_auc["value"] = val_metrics_tuned["auc_roc"]
+            best_roc_auc["epoch"] = epoch
+            best_roc_auc["state"] = _make_checkpoint()
+            best_roc_auc["threshold"] = val_best_thr
+
+        if val_best_f1 > best_f1["value"]:
+            best_f1["value"] = val_best_f1
+            best_f1["epoch"] = epoch
+            best_f1["state"] = _make_checkpoint()
+            best_f1["threshold"] = val_best_thr
+
+        if val_loss < best_val_loss["value"]:
+            best_val_loss["value"] = val_loss
+            best_val_loss["epoch"] = epoch
+            best_val_loss["state"] = _make_checkpoint()
+            best_val_loss["threshold"] = val_best_thr
+
+        # Early stopping based on checkpoint_metric
+        metric_improved = False
+        if checkpoint_metric == "best_f1" and best_f1["epoch"] == epoch:
+            metric_improved = True
+        elif checkpoint_metric == "val_loss" and best_val_loss["epoch"] == epoch:
+            metric_improved = True
+        elif checkpoint_metric in ("roc_auc", "pr_auc") and best_roc_auc["epoch"] == epoch:
+            metric_improved = True
+
+        if metric_improved:
+            no_improve = 0
         else:
             no_improve += 1
             if no_improve >= patience:
                 print(f"Early stopping at epoch {epoch} (patience={patience})")
                 break
 
+    # ── Handle NaN abort ───────────────────────────────────────────────
+    if nan_abort and best_f1["state"] is None and best_roc_auc["state"] is None:
+        print("\n⚠️  Training aborted due to NaN/Inf before any valid checkpoint was saved.")
+        return None
+
     # ── Plot training curves (loss, ROC-AUC, F1) ─────────────────────
+    # Select best checkpoint based on configured metric
+    if checkpoint_metric == "best_f1" and best_f1["state"] is not None:
+        best_state = best_f1["state"]
+        best_threshold = best_f1["threshold"]
+    elif checkpoint_metric == "val_loss" and best_val_loss["state"] is not None:
+        best_state = best_val_loss["state"]
+        best_threshold = best_val_loss["threshold"]
+    elif best_roc_auc["state"] is not None:
+        best_state = best_roc_auc["state"]
+        best_threshold = best_roc_auc["threshold"]
+    elif best_f1["state"] is not None:
+        best_state = best_f1["state"]
+        best_threshold = best_f1["threshold"]
+    else:
+        best_state = None
+        best_threshold = 0.5
+
     if epoch_history:
         if best_state is not None:
             best_state["epoch_history"] = epoch_history
@@ -278,7 +384,7 @@ def train_cnn_classifier(config: CNNTransformerConfig | None = None):
         axes[0].set_title("CNN Classifier — Loss"); axes[0].legend(); axes[0].grid(True)
 
         axes[1].plot(epochs_arr, [h["roc_auc"] for h in epoch_history], label="Val ROC-AUC", color="tab:orange")
-        axes[1].axhline(y=best_auc, color="r", linestyle="--", alpha=0.5, label=f"Best={best_auc:.4f}")
+        axes[1].axhline(y=best_roc_auc["value"], color="r", linestyle="--", alpha=0.5, label=f"Best={best_roc_auc['value']:.4f}")
         axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("ROC-AUC")
         axes[1].set_title("CNN Classifier — ROC-AUC"); axes[1].legend(); axes[1].grid(True)
         axes[1].set_ylim(0, 1.05)
@@ -300,19 +406,7 @@ def train_cnn_classifier(config: CNNTransformerConfig | None = None):
         print("Training failed to improve beyond initialization.")
         return None
 
-    # Tune probability threshold on validation set (maximize F1)
-    best_threshold = 0.5
-    best_val_f1 = 0.0
-    if val_loader is not None and len(val_loader.dataset) > 0:
-        final_model_eval = model.module if isinstance(model, DataParallel) else model
-        final_model_eval.load_state_dict(best_state["model_state_dict"])
-        _, _, val_probs, val_targets = _eval_epoch(model, val_loader, criterion, device)
-        best_threshold, best_val_f1 = find_best_f1_threshold(val_targets, val_probs)
-        best_state["best_threshold"] = best_threshold
-        best_state["best_val_f1_at_threshold"] = best_val_f1
-        print(
-            f"Best val threshold (maximize F1): {best_threshold:.4f} (val F1 {best_val_f1:.4f})"
-        )
+    best_state["best_threshold"] = best_threshold
 
     # Final evaluation on held-out test set
     if test_loader is not None and len(test_loader.dataset) > 0:
